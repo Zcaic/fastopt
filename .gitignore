@@ -1,0 +1,10 @@
+build/
+out/
+install/
+__pycache__/
+*.pyc
+*.pyd
+*.so
+*.dll
+.pytest_cache/
+compile_commands.json

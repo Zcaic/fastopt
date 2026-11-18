@@ -1,0 +1,24 @@
+[build-system]
+requires = ["scikit-build-core>=0.8.0", "nanobind>=2.0.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "fastopt"
+version = "0.1.0"
+description = "High-performance tensor-level automatic differentiation and optimization framework"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.22",
+    "scipy>=1.10",
+    "casadi>=3.6",
+    "pymoo>=0.6.0",
+]
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+wheel.packages = ["python/fastopt"]
+build-dir = "build/{wheel_tag}"
+
+[tool.scikit-build.cmake.define]
+FASTOPT_ENABLE_SIMD = "ON"

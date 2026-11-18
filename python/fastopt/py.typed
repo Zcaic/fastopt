@@ -1,0 +1,1 @@
+# PEP 561 marker file indicating that fastopt ships inline type annotations and .pyi stubs.
