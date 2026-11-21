@@ -12,7 +12,7 @@ All comments are written in English.
 import time
 import numpy as np
 from scipy.interpolate import make_interp_spline
-import python.fastopt as fo
+import fastopt as fo
 
 
 def finite_diff_jacobian(eval_fn, x: np.ndarray, eps: float = 1e-6) -> np.ndarray:

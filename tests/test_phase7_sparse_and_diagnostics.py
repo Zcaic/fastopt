@@ -10,7 +10,7 @@ All comments are written in English.
 
 import time
 import numpy as np
-import python.fastopt as fo
+import fastopt as fo
 
 
 def fd_jacobian(ev: fo._fastopt_impl.Evaluator, x0: np.ndarray, out_idx: int, eps: float = 1e-6) -> np.ndarray:

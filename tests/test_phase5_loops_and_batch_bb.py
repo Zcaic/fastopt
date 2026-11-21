@@ -21,7 +21,7 @@ import os
 import sys
 import time
 import numpy as np
-import python.fastopt as fo
+import fastopt as fo
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_phase4_blackbox_and_pymoo import _ensure_pymoo_available_for_test

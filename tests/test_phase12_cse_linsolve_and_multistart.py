@@ -15,7 +15,7 @@ import time
 import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "python")))
-import python.fastopt as fo
+import fastopt as fo
 
 
 def fd_gradient(ev: fo.Evaluator, x: np.ndarray, out_idx: int = 0, eps: float = 1e-6) -> np.ndarray:

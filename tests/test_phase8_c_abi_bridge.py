@@ -23,7 +23,7 @@ import sys
 import sysconfig
 import time
 import numpy as np
-import python.fastopt as fo
+import fastopt as fo
 
 
 _MOCK_BEMT_CPP_SOURCE = r"""

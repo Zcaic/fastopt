@@ -288,7 +288,10 @@ void UnaryOpNode::backward_hessian(Workspace& ws) const {
         if (zb == 0.0 && zdb == 0.0) continue;
         double df = 0.0, d2f = 0.0;
         unary_scalar_jet(op, x_ptr[i], z_ptr[i], df, d2f);
-        xdb_ptr[i] += zdb * df + zb * d2f * xd_ptr[i];
+        double acc = 0.0;
+        if (zdb != 0.0) acc += zdb * df;
+        if (zb != 0.0 && xd_ptr[i] != 0.0) acc += zb * d2f * xd_ptr[i];
+        xdb_ptr[i] += acc;
     }
 }
 
@@ -643,10 +646,22 @@ void BinaryOpNode::backward_hessian(Workspace& ws) const {
             const double ad = lhs.requires_grad ? Ad(ra, ca) : 0.0;
             const double bd = rhs.requires_grad ? Bd(rb, cb) : 0.0;
             if (lhs.requires_grad) {
-                Adb(ra, ca) += zdb * fa + zb * (faa * ad + fab * bd);
+                double acc_a = 0.0;
+                if (zdb != 0.0) acc_a += zdb * fa;
+                if (zb != 0.0) {
+                    if (ad != 0.0) acc_a += zb * faa * ad;
+                    if (bd != 0.0) acc_a += zb * fab * bd;
+                }
+                Adb(ra, ca) += acc_a;
             }
             if (rhs.requires_grad) {
-                Bdb(rb, cb) += zdb * fb + zb * (fab * ad + fbb * bd);
+                double acc_b = 0.0;
+                if (zdb != 0.0) acc_b += zdb * fb;
+                if (zb != 0.0) {
+                    if (ad != 0.0) acc_b += zb * fab * ad;
+                    if (bd != 0.0) acc_b += zb * fbb * bd;
+                }
+                Bdb(rb, cb) += acc_b;
             }
         }
     }
@@ -2402,7 +2417,15 @@ void MapNode::forward(Workspace& ws) const {
 }
 
 void MapNode::backward(Workspace& ws) const {
-    if (ws.bar.segment(offset, size()).squaredNorm() == 0.0) return;
+    if (ws.bar.segment(offset, size()).squaredNorm() == 0.0) {
+        const int tid_clr = omp_in_parallel() ? omp_get_thread_num() : 0;
+        if (tid_clr < static_cast<int>(thread_tapes_.size())) {
+            for (auto& sws : thread_tapes_[static_cast<std::size_t>(tid_clr)]) {
+                sws.bar.setZero();
+            }
+        }
+        return;
+    }
 
     const int outer_tid = omp_in_parallel() ? omp_get_thread_num() : 0;
     auto& tape = ensure_tape(outer_tid, true, false);
@@ -2680,7 +2703,15 @@ void ScanNode::forward(Workspace& ws) const {
 }
 
 void ScanNode::backward(Workspace& ws) const {
-    if (ws.bar.segment(offset, size()).squaredNorm() == 0.0) return;
+    if (ws.bar.segment(offset, size()).squaredNorm() == 0.0) {
+        const int tid_clr = omp_in_parallel() ? omp_get_thread_num() : 0;
+        if (tid_clr < static_cast<int>(thread_tapes_.size())) {
+            for (auto& sws : thread_tapes_[static_cast<std::size_t>(tid_clr)]) {
+                sws.bar.setZero();
+            }
+        }
+        return;
+    }
 
     const int outer_tid = omp_in_parallel() ? omp_get_thread_num() : 0;
     auto& tape = ensure_tape(outer_tid, true, false);
@@ -2882,6 +2913,3807 @@ void ScanNode::backward_hessian(Workspace& ws) const {
 // ============================================================================
 // 17. Operator Builder Functions (with CSE Hash-Consing & Constant Folding)
 // ============================================================================
+// ============================================================================
+// 19. Fused CPU Neural Network Surrogate Implementation (MLP / ResNet / LN)
+// ============================================================================
+namespace {
+
+template <typename Scalar>
+inline void nn_act_val_deriv(NNActivation act, Scalar u, Scalar& y, Scalar& dy) {
+    constexpr Scalar kZero = Scalar(0);
+    constexpr Scalar kOne = Scalar(1);
+    constexpr Scalar kHalf = Scalar(0.5);
+    constexpr Scalar kInvSqrt2 = Scalar(0.70710678118654752440);
+    constexpr Scalar kInvSqrt2Pi = Scalar(0.39894228040143267794);
+
+    switch (act) {
+        case NNActivation::Identity:
+            y = u;
+            dy = kOne;
+            return;
+        case NNActivation::Tanh: {
+            const Scalar t = std::tanh(u);
+            y = t;
+            dy = kOne - t * t;
+            return;
+        }
+        case NNActivation::SiLU: {
+            // Numerically stable sigmoid
+            const Scalar s = (u >= kZero)
+                ? (kOne / (kOne + std::exp(-u)))
+                : (std::exp(u) / (kOne + std::exp(u)));
+            y = u * s;
+            dy = s * (kOne + u * (kOne - s));
+            return;
+        }
+        case NNActivation::GELU: {
+            const Scalar cdf = kHalf * (kOne + std::erf(u * kInvSqrt2));
+            const Scalar pdf = kInvSqrt2Pi * std::exp(-kHalf * u * u);
+            y = u * cdf;
+            dy = cdf + u * pdf;
+            return;
+        }
+        case NNActivation::ReLU:
+            if (u > kZero) {
+                y = u;
+                dy = kOne;
+            } else {
+                y = kZero;
+                dy = kZero;
+            }
+            return;
+        case NNActivation::Softplus: {
+            const Scalar s = (u >= kZero)
+                ? (kOne / (kOne + std::exp(-u)))
+                : (std::exp(u) / (kOne + std::exp(u)));
+            y = (u > kZero) ? (u + std::log1p(std::exp(-u))) : std::log1p(std::exp(u));
+            dy = s;
+            return;
+        }
+        case NNActivation::ELU:
+            if (u >= kZero) {
+                y = u;
+                dy = kOne;
+            } else {
+                const Scalar e = std::exp(u);
+                y = e - kOne;
+                dy = e;
+            }
+            return;
+        case NNActivation::Sin:
+            y = std::sin(u);
+            dy = std::cos(u);
+            return;
+        case NNActivation::Sigmoid: {
+            const Scalar s = (u >= kZero)
+                ? (kOne / (kOne + std::exp(-u)))
+                : (std::exp(u) / (kOne + std::exp(u)));
+            y = s;
+            dy = s * (kOne - s);
+            return;
+        }
+        case NNActivation::LeakyReLU: {
+            constexpr Scalar kSlope = Scalar(0.01);
+            if (u >= kZero) { y = u; dy = kOne; }
+            else { y = kSlope * u; dy = kSlope; }
+            return;
+        }
+        case NNActivation::Mish: {
+            const Scalar s = (u >= kZero)
+                ? (kOne / (kOne + std::exp(-u)))
+                : (std::exp(u) / (kOne + std::exp(u)));
+            const Scalar sp = (u > kZero) ? (u + std::log1p(std::exp(-u))) : std::log1p(std::exp(u));
+            const Scalar t = std::tanh(sp);
+            y = u * t;
+            dy = t + u * (kOne - t * t) * s;
+            return;
+        }
+        case NNActivation::SELU: {
+            constexpr Scalar kLam = Scalar(1.0507009873554804934193349852946);
+            constexpr Scalar kAlp = Scalar(1.6732632423543772848170429916717);
+            if (u >= kZero) { y = kLam * u; dy = kLam; }
+            else { const Scalar e = std::exp(u); y = kLam * kAlp * (e - kOne); dy = kLam * kAlp * e; }
+            return;
+        }
+        case NNActivation::HardSwish: {
+            if (u <= Scalar(-3)) { y = kZero; dy = kZero; }
+            else if (u >= Scalar(3)) { y = u; dy = kOne; }
+            else { y = u * (u + Scalar(3)) / Scalar(6); dy = (Scalar(2) * u + Scalar(3)) / Scalar(6); }
+            return;
+        }
+    }
+    y = u;
+    dy = kOne;
+}
+
+template <typename Scalar>
+inline void nn_act_jet2(NNActivation act, Scalar u, Scalar& dy, Scalar& d2y) {
+    constexpr Scalar kZero = Scalar(0);
+    constexpr Scalar kOne = Scalar(1);
+    constexpr Scalar kTwo = Scalar(2);
+    constexpr Scalar kHalf = Scalar(0.5);
+    constexpr Scalar kInvSqrt2 = Scalar(0.70710678118654752440);
+    constexpr Scalar kInvSqrt2Pi = Scalar(0.39894228040143267794);
+
+    switch (act) {
+        case NNActivation::Identity:
+            dy = kOne;
+            d2y = kZero;
+            return;
+        case NNActivation::Tanh: {
+            const Scalar t = std::tanh(u);
+            const Scalar dt = kOne - t * t;
+            dy = dt;
+            d2y = -kTwo * t * dt;
+            return;
+        }
+        case NNActivation::SiLU: {
+            const Scalar s = (u >= kZero)
+                ? (kOne / (kOne + std::exp(-u)))
+                : (std::exp(u) / (kOne + std::exp(u)));
+            const Scalar one_m_s = kOne - s;
+            dy = s * (kOne + u * one_m_s);
+            d2y = s * one_m_s * (kTwo + u * (kOne - kTwo * s));
+            return;
+        }
+        case NNActivation::GELU: {
+            const Scalar cdf = kHalf * (kOne + std::erf(u * kInvSqrt2));
+            const Scalar pdf = kInvSqrt2Pi * std::exp(-kHalf * u * u);
+            dy = cdf + u * pdf;
+            d2y = pdf * (kTwo - u * u);
+            return;
+        }
+        case NNActivation::ReLU:
+            dy = (u > kZero) ? kOne : kZero;
+            d2y = kZero;
+            return;
+        case NNActivation::Softplus: {
+            const Scalar s = (u >= kZero)
+                ? (kOne / (kOne + std::exp(-u)))
+                : (std::exp(u) / (kOne + std::exp(u)));
+            dy = s;
+            d2y = s * (kOne - s);
+            return;
+        }
+        case NNActivation::ELU:
+            if (u >= kZero) {
+                dy = kOne;
+                d2y = kZero;
+            } else {
+                const Scalar e = std::exp(u);
+                dy = e;
+                d2y = e;
+            }
+            return;
+        case NNActivation::Sin:
+            dy = std::cos(u);
+            d2y = -std::sin(u);
+            return;
+        case NNActivation::Sigmoid: {
+            const Scalar s = (u >= kZero)
+                ? (kOne / (kOne + std::exp(-u)))
+                : (std::exp(u) / (kOne + std::exp(u)));
+            const Scalar ds = s * (kOne - s);
+            dy = ds;
+            d2y = ds * (kOne - kTwo * s);
+            return;
+        }
+        case NNActivation::LeakyReLU: {
+            constexpr Scalar kSlope = Scalar(0.01);
+            dy = (u >= kZero) ? kOne : kSlope;
+            d2y = kZero;
+            return;
+        }
+        case NNActivation::Mish: {
+            const Scalar s = (u >= kZero)
+                ? (kOne / (kOne + std::exp(-u)))
+                : (std::exp(u) / (kOne + std::exp(u)));
+            const Scalar sp = (u > kZero) ? (u + std::log1p(std::exp(-u))) : std::log1p(std::exp(u));
+            const Scalar t = std::tanh(sp);
+            const Scalar sech2 = kOne - t * t;
+            dy = t + u * sech2 * s;
+            d2y = sech2 * s * (kTwo + u * (kOne - s) - kTwo * u * t * s);
+            return;
+        }
+        case NNActivation::SELU: {
+            constexpr Scalar kLam = Scalar(1.0507009873554804934193349852946);
+            constexpr Scalar kAlp = Scalar(1.6732632423543772848170429916717);
+            if (u >= kZero) { dy = kLam; d2y = kZero; }
+            else { const Scalar e = std::exp(u); dy = kLam * kAlp * e; d2y = dy; }
+            return;
+        }
+        case NNActivation::HardSwish: {
+            if (u <= Scalar(-3)) { dy = kZero; d2y = kZero; }
+            else if (u >= Scalar(3)) { dy = kOne; d2y = kZero; }
+            else { dy = (kTwo * u + Scalar(3)) / Scalar(6); d2y = Scalar(1) / Scalar(3); }
+            return;
+        }
+    }
+    dy = kOne;
+    d2y = kZero;
+}
+
+template <typename Scalar>
+struct MLPLayerTraits;
+
+template <>
+struct MLPLayerTraits<double> {
+    using Layer = MLPEngineData::LayerD;
+    using Mat = Eigen::MatrixXd;
+    using Vec = Eigen::VectorXd;
+    static const std::vector<Layer>& layers(const MLPEngineData& d) { return d.layers_d; }
+    static const Vec& in_mean(const MLPEngineData& d) { return d.in_mean_d; }
+    static const Vec& in_inv_std(const MLPEngineData& d) { return d.in_inv_std_d; }
+    static const Vec& out_mean(const MLPEngineData& d) { return d.out_mean_d; }
+    static const Vec& out_std(const MLPEngineData& d) { return d.out_std_d; }
+};
+
+template <>
+struct MLPLayerTraits<float> {
+    using Layer = MLPEngineData::LayerF;
+    using Mat = Eigen::MatrixXf;
+    using Vec = Eigen::VectorXf;
+    static const std::vector<Layer>& layers(const MLPEngineData& d) { return d.layers_f; }
+    static const Vec& in_mean(const MLPEngineData& d) { return d.in_mean_f; }
+    static const Vec& in_inv_std(const MLPEngineData& d) { return d.in_inv_std_f; }
+    static const Vec& out_mean(const MLPEngineData& d) { return d.out_mean_f; }
+    static const Vec& out_std(const MLPEngineData& d) { return d.out_std_f; }
+};
+
+template <typename Scalar>
+struct MLPScratch {
+    using Mat = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>;
+    using Vec = Eigen::Matrix<Scalar, Eigen::Dynamic, 1>;
+
+    bool has_primal = false;
+    bool has_tangent = false;
+    Eigen::VectorXd cached_x;
+    Eigen::VectorXd cached_xdot;
+
+    // Primal buffers: H[0] is normalized input, H[l+1] is output of layer l
+    std::vector<Mat> H;        // size L + 1
+    std::vector<Mat> Z;        // size L (post-linear)
+    std::vector<Mat> U;        // size L (pre-activation, post-LN)
+    std::vector<Mat> LN_zhat;  // size L (only resized if layer_norm)
+    std::vector<Vec> LN_s;     // size L (length B, only resized if layer_norm)
+
+    // Tangent buffers
+    std::vector<Mat> dH;       // size L + 1
+    std::vector<Mat> dZ;       // size L
+    std::vector<Mat> dU;       // size L
+    std::vector<Mat> LN_dzhat; // size L
+    std::vector<Vec> LN_p;     // size L (length B: (1/D) * sum(zhat * dZ))
+
+    // Reverse scratch buffers (reused across layers to avoid heap allocations)
+    Mat bar_cur;
+    Mat bar_next;
+    Mat bar_u;
+    Mat bar_z;
+    Mat dbar_cur;
+    Mat dbar_next;
+    Mat dbar_u;
+    Mat dbar_z;
+
+    void ensure_primal(const MLPEngineData& data, Eigen::Index B) {
+        const auto& layers = MLPLayerTraits<Scalar>::layers(data);
+        const std::size_t L = layers.size();
+        if (H.size() == L + 1 && H[0].rows() == data.d_in && H[0].cols() == B) {
+            bool ok = true;
+            for (std::size_t l = 0; l < L; ++l) {
+                if (U[l].rows() != layers[l].d_out || U[l].cols() != B) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok) return;
+        }
+        H.resize(L + 1);
+        Z.resize(L);
+        U.resize(L);
+        LN_zhat.resize(L);
+        LN_s.resize(L);
+        H[0].resize(data.d_in, B);
+        for (std::size_t l = 0; l < L; ++l) {
+            const Eigen::Index dout = layers[l].d_out;
+            U[l].resize(dout, B);
+            H[l + 1].resize(dout, B);
+            if (layers[l].layer_norm) {
+                Z[l].resize(dout, B);
+                LN_zhat[l].resize(dout, B);
+                LN_s[l].resize(B);
+            }
+        }
+    }
+
+    void ensure_tangent(const MLPEngineData& data, Eigen::Index B) {
+        const auto& layers = MLPLayerTraits<Scalar>::layers(data);
+        const std::size_t L = layers.size();
+        if (dH.size() == L + 1 && dH[0].cols() == B) return;
+        dH.resize(L + 1);
+        dZ.resize(L);
+        dU.resize(L);
+        LN_dzhat.resize(L);
+        LN_p.resize(L);
+        dH[0].resize(data.d_in, B);
+        for (std::size_t l = 0; l < L; ++l) {
+            const Eigen::Index dout = layers[l].d_out;
+            dZ[l].resize(dout, B);
+            dU[l].resize(dout, B);
+            dH[l + 1].resize(dout, B);
+            if (layers[l].layer_norm) {
+                LN_dzhat[l].resize(dout, B);
+                LN_p[l].resize(B);
+            }
+        }
+    }
+};
+
+// Fast contiguous column-major GEMV helpers for B == 1 small/medium layers.
+// Bypassing external BLAS (OpenBLAS/MKL) for tiny (<= 360x360) single-vector products
+// eliminates 10-15 us/layer thread-pool barrier overhead while letting GCC/Clang/MSVC
+// emit pure AVX2+FMA instructions on contiguous W.col(j).
+template <typename Scalar>
+inline void mlp_gemv_add_bias(const Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& W,
+                              const Eigen::Matrix<Scalar, Eigen::Dynamic, 1>& b,
+                              const Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& H,
+                              Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& Z) {
+    const Eigen::Index d_out = W.rows();
+    const Eigen::Index d_in = W.cols();
+    const Eigen::Index B = H.cols();
+    if (B == 1 && d_out * d_in <= 131072) {
+        Scalar* z_ptr = Z.data();
+        const Scalar* b_ptr = b.data();
+        const Scalar* h_ptr = H.data();
+        std::memcpy(z_ptr, b_ptr, static_cast<std::size_t>(d_out) * sizeof(Scalar));
+        for (Eigen::Index j = 0; j < d_in; ++j) {
+            const Scalar hj = h_ptr[j];
+            const Scalar* w_col = W.data() + j * d_out;
+            for (Eigen::Index i = 0; i < d_out; ++i) {
+                z_ptr[i] += w_col[i] * hj;
+            }
+        }
+    } else {
+        Z.noalias() = W * H;
+        Z.colwise() += b;
+    }
+}
+
+template <typename Scalar>
+inline void mlp_gemv_nobias(const Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& W,
+                            const Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& H,
+                            Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& Z) {
+    const Eigen::Index d_out = W.rows();
+    const Eigen::Index d_in = W.cols();
+    const Eigen::Index B = H.cols();
+    if (B == 1 && d_out * d_in <= 131072) {
+        Scalar* z_ptr = Z.data();
+        const Scalar* h_ptr = H.data();
+        std::memset(z_ptr, 0, static_cast<std::size_t>(d_out) * sizeof(Scalar));
+        for (Eigen::Index j = 0; j < d_in; ++j) {
+            const Scalar hj = h_ptr[j];
+            const Scalar* w_col = W.data() + j * d_out;
+            for (Eigen::Index i = 0; i < d_out; ++i) {
+                z_ptr[i] += w_col[i] * hj;
+            }
+        }
+    } else {
+        Z.noalias() = W * H;
+    }
+}
+
+template <typename Scalar>
+inline void mlp_gemv_trans(const Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& W,
+                           const Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& Y,
+                           Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& X) {
+    const Eigen::Index d_out = W.rows();
+    const Eigen::Index d_in = W.cols();
+    const Eigen::Index B = Y.cols();
+    if (B == 1 && d_out * d_in <= 131072) {
+        Scalar* x_ptr = X.data();
+        const Scalar* y_ptr = Y.data();
+        for (Eigen::Index j = 0; j < d_in; ++j) {
+            const Scalar* w_col = W.data() + j * d_out;
+            Scalar acc = Scalar(0);
+            for (Eigen::Index i = 0; i < d_out; ++i) {
+                acc += w_col[i] * y_ptr[i];
+            }
+            x_ptr[j] = acc;
+        }
+    } else {
+        X.noalias() = W.transpose() * Y;
+    }
+}
+
+// Fused single-pass (bias_add -> U, activation -> Hnext, optional residual += Hprev)
+// Eliminates redundant Z->U copies and separate bias/residual RAM sweeps.
+template <typename Scalar>
+inline void mlp_fused_bias_act_res_fwd(
+    NNActivation act,
+    bool residual,
+    const Eigen::Matrix<Scalar, Eigen::Dynamic, 1>& bias,
+    Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& U,
+    const Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& Hprev,
+    Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& Hnext) {
+    const Eigen::Index D = U.rows();
+    const Eigen::Index B = U.cols();
+    const Eigen::Index n_tot = D * B;
+    const bool use_omp = (!omp_in_parallel()) && (n_tot >= 16384) && (B >= 8) && (omp_get_max_threads() > 1);
+
+    auto process_cols = [&](Eigen::Index b0, Eigen::Index cols) {
+        const Eigen::Index len = D * cols;
+        Scalar* u_ptr = U.data() + b0 * D;
+        Scalar* h_ptr = Hnext.data() + b0 * D;
+        const Scalar* prev_ptr = residual ? (Hprev.data() + b0 * D) : nullptr;
+        const Scalar* b_ptr = bias.data();
+
+        // Add bias per column into U (contiguous column-major, L1 cache resident)
+        for (Eigen::Index c = 0; c < cols; ++c) {
+            Eigen::Map<Eigen::Array<Scalar, Eigen::Dynamic, 1>> uc(u_ptr + c * D, D);
+            Eigen::Map<const Eigen::Array<Scalar, Eigen::Dynamic, 1>> bv(b_ptr, D);
+            uc += bv;
+        }
+
+        Eigen::Map<const Eigen::Array<Scalar, Eigen::Dynamic, 1>> u_seg(u_ptr, len);
+        Eigen::Map<Eigen::Array<Scalar, Eigen::Dynamic, 1>> h_seg(h_ptr, len);
+        if (act == NNActivation::Identity) {
+            h_seg = u_seg;
+        } else if (act == NNActivation::Tanh) {
+            h_seg = u_seg.tanh();
+        } else if (act == NNActivation::ReLU) {
+            h_seg = u_seg.max(Scalar(0));
+        } else if (act == NNActivation::Sin) {
+            h_seg = u_seg.sin();
+        } else if (act == NNActivation::SiLU) {
+            h_seg = u_seg / (Scalar(1) + (-u_seg).min(Scalar(80)).exp());
+        } else if (act == NNActivation::Softplus) {
+            h_seg = u_seg.max(Scalar(0)) + (-u_seg.abs()).exp().log1p();
+        } else {
+            for (Eigen::Index k = 0; k < len; ++k) {
+                Scalar y_val, dy_val;
+                nn_act_val_deriv(act, u_ptr[k], y_val, dy_val);
+                h_ptr[k] = y_val;
+            }
+        }
+        if (residual) {
+            Eigen::Map<const Eigen::Array<Scalar, Eigen::Dynamic, 1>> p_seg(prev_ptr, len);
+            h_seg += p_seg;
+        }
+    };
+
+    if (!use_omp) {
+        process_cols(0, B);
+        return;
+    }
+    const int n_threads = std::min<int>(omp_get_max_threads(), static_cast<int>(B));
+    const Eigen::Index chunk = (B + n_threads - 1) / n_threads;
+    #pragma omp parallel for num_threads(n_threads) schedule(static)
+    for (int tid = 0; tid < n_threads; ++tid) {
+        const Eigen::Index b0 = static_cast<Eigen::Index>(tid) * chunk;
+        const Eigen::Index cols = std::min(chunk, B - b0);
+        if (cols > 0) process_cols(b0, cols);
+    }
+}
+
+// Vectorized & OpenMP-accelerated activation backward VJP: bar_u = bar_cur * phi'(U)
+template <typename Scalar>
+inline void mlp_apply_activation_bwd(
+    NNActivation act,
+    const Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& U,
+    const Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& bar_cur,
+    Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& bar_u) {
+    const Eigen::Index n_tot = U.size();
+    if (act == NNActivation::Identity) {
+        bar_u = bar_cur;
+        return;
+    }
+    const bool use_omp = (!omp_in_parallel()) && (n_tot >= 16384) && (omp_get_max_threads() > 1);
+    const Scalar* u_base = U.data();
+    const Scalar* bc_base = bar_cur.data();
+    Scalar* bu_base = bar_u.data();
+
+    auto process_range = [&](Eigen::Index i0, Eigen::Index len) {
+        Eigen::Map<const Eigen::Array<Scalar, Eigen::Dynamic, 1>> u_seg(u_base + i0, len);
+        Eigen::Map<const Eigen::Array<Scalar, Eigen::Dynamic, 1>> bc_seg(bc_base + i0, len);
+        Eigen::Map<Eigen::Array<Scalar, Eigen::Dynamic, 1>> bu_seg(bu_base + i0, len);
+        if (act == NNActivation::SiLU) {
+            // s = 1 / (1 + exp(-u)), dy = s * (1 + u * (1 - s))
+            auto s = (Scalar(1) + (-u_seg).min(Scalar(80)).exp()).inverse();
+            bu_seg = bc_seg * s * (Scalar(1) + u_seg * (Scalar(1) - s));
+        } else if (act == NNActivation::Tanh) {
+            auto t_val = u_seg.tanh();
+            bu_seg = bc_seg * (Scalar(1) - t_val * t_val);
+        } else if (act == NNActivation::ReLU) {
+            bu_seg = (u_seg > Scalar(0)).select(bc_seg, Scalar(0));
+        } else if (act == NNActivation::Sin) {
+            bu_seg = bc_seg * u_seg.cos();
+        } else if (act == NNActivation::Softplus) {
+            auto s = (Scalar(1) + (-u_seg).min(Scalar(80)).exp()).inverse();
+            bu_seg = bc_seg * s;
+        } else {
+            for (Eigen::Index k = 0; k < len; ++k) {
+                Scalar y_val, dy_val;
+                nn_act_val_deriv(act, u_base[i0 + k], y_val, dy_val);
+                bu_base[i0 + k] = bc_base[i0 + k] * dy_val;
+            }
+        }
+    };
+
+    if (!use_omp) {
+        process_range(0, n_tot);
+        return;
+    }
+    const int n_threads = omp_get_max_threads();
+    const Eigen::Index chunk = (n_tot + n_threads - 1) / n_threads;
+    #pragma omp parallel for num_threads(n_threads) schedule(static)
+    for (int tid = 0; tid < n_threads; ++tid) {
+        const Eigen::Index i0 = static_cast<Eigen::Index>(tid) * chunk;
+        const Eigen::Index len = std::min(chunk, n_tot - i0);
+        if (len > 0) process_range(i0, len);
+    }
+}
+
+// Forward-only L3-cache ping-pong scratchpad for CompiledMLP::eval (zero malloc/free per call,
+// only 2 matrices allocated instead of 3*(L+1), keeping large batches inside L3 cache).
+template <typename Scalar>
+struct MLPEvalPingPong {
+    using Mat = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>;
+    Mat buf_a;
+    Mat buf_b;
+    Mat buf_ln;
+};
+
+template <typename Scalar>
+inline void mlp_apply_activation_fwd(NNActivation act,
+                                     const Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& U,
+                                     Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& Hnext);
+
+template <typename Scalar>
+void mlp_run_eval_only(const MLPEngineData& data,
+                       const Eigen::Map<const Eigen::MatrixXd>& X_in,
+                       Eigen::Map<Eigen::MatrixXd>& Y_out,
+                       MLPEvalPingPong<Scalar>& pp) {
+    const auto& layers = MLPLayerTraits<Scalar>::layers(data);
+    const std::size_t L = layers.size();
+    const Eigen::Index B = X_in.cols();
+
+    pp.buf_a.resize(data.d_in, B);
+    pp.buf_a = X_in.cast<Scalar>();
+    if (data.has_in_norm) {
+        const auto& mu = MLPLayerTraits<Scalar>::in_mean(data);
+        const auto& inv_s = MLPLayerTraits<Scalar>::in_inv_std(data);
+        pp.buf_a.colwise() -= mu;
+        pp.buf_a.array().colwise() *= inv_s.array();
+    }
+
+    for (std::size_t l = 0; l < L; ++l) {
+        const auto& ly = layers[l];
+        pp.buf_b.resize(ly.d_out, B);
+
+        if (!ly.layer_norm) {
+            // Fast path: GEMM into buf_b, then single-pass fused (bias + activation + residual)
+            mlp_gemv_nobias<Scalar>(ly.W, pp.buf_a, pp.buf_b);
+            const Eigen::Index D = ly.d_out;
+            const Eigen::Index n_tot = D * B;
+            const bool use_omp = (!omp_in_parallel()) && (n_tot >= 16384) && (B >= 8) && (omp_get_max_threads() > 1);
+
+            auto fuse_cols = [&](Eigen::Index b0, Eigen::Index cols) {
+                const Eigen::Index len = D * cols;
+                Scalar* z_ptr = pp.buf_b.data() + b0 * D;
+                const Scalar* prev_ptr = ly.residual ? (pp.buf_a.data() + b0 * D) : nullptr;
+                const Scalar* b_ptr = ly.b.data();
+                for (Eigen::Index c = 0; c < cols; ++c) {
+                    Eigen::Map<Eigen::Array<Scalar, Eigen::Dynamic, 1>> zc(z_ptr + c * D, D);
+                    Eigen::Map<const Eigen::Array<Scalar, Eigen::Dynamic, 1>> bv(b_ptr, D);
+                    zc += bv;
+                }
+                Eigen::Map<Eigen::Array<Scalar, Eigen::Dynamic, 1>> z_seg(z_ptr, len);
+                if (ly.activation == NNActivation::Tanh) {
+                    z_seg = z_seg.tanh();
+                } else if (ly.activation == NNActivation::ReLU) {
+                    z_seg = z_seg.max(Scalar(0));
+                } else if (ly.activation == NNActivation::Sin) {
+                    z_seg = z_seg.sin();
+                } else if (ly.activation == NNActivation::SiLU) {
+                    z_seg = z_seg / (Scalar(1) + (-z_seg).min(Scalar(80)).exp());
+                } else if (ly.activation == NNActivation::Softplus) {
+                    z_seg = z_seg.max(Scalar(0)) + (-z_seg.abs()).exp().log1p();
+                } else if (ly.activation != NNActivation::Identity) {
+                    for (Eigen::Index k = 0; k < len; ++k) {
+                        Scalar y_val, dy_val;
+                        nn_act_val_deriv(ly.activation, z_ptr[k], y_val, dy_val);
+                        z_ptr[k] = y_val;
+                    }
+                }
+                if (ly.residual) {
+                    Eigen::Map<const Eigen::Array<Scalar, Eigen::Dynamic, 1>> p_seg(prev_ptr, len);
+                    z_seg += p_seg;
+                }
+            };
+
+            if (!use_omp) {
+                fuse_cols(0, B);
+            } else {
+                const int n_threads = std::min<int>(omp_get_max_threads(), static_cast<int>(B));
+                const Eigen::Index chunk = (B + n_threads - 1) / n_threads;
+                #pragma omp parallel for num_threads(n_threads) schedule(static)
+                for (int tid = 0; tid < n_threads; ++tid) {
+                    const Eigen::Index b0 = static_cast<Eigen::Index>(tid) * chunk;
+                    const Eigen::Index cols = std::min(chunk, B - b0);
+                    if (cols > 0) fuse_cols(b0, cols);
+                }
+            }
+        } else {
+            // LayerNorm path
+            mlp_gemv_add_bias<Scalar>(ly.W, ly.b, pp.buf_a, pp.buf_b);
+            const Eigen::Index D = ly.d_out;
+            const Scalar inv_D = Scalar(1) / static_cast<Scalar>(D);
+            const bool has_gamma = (ly.ln_gamma.size() == D);
+            const bool has_beta = (ly.ln_beta.size() == D);
+            pp.buf_ln.resize(D, B);
+            for (Eigen::Index b = 0; b < B; ++b) {
+                const Scalar mean = pp.buf_b.col(b).sum() * inv_D;
+                Scalar var = Scalar(0);
+                for (Eigen::Index i = 0; i < D; ++i) {
+                    const Scalar c = pp.buf_b(i, b) - mean;
+                    var += c * c;
+                }
+                var *= inv_D;
+                const Scalar s = Scalar(1) / std::sqrt(var + ly.ln_eps);
+                for (Eigen::Index i = 0; i < D; ++i) {
+                    const Scalar zh = (pp.buf_b(i, b) - mean) * s;
+                    const Scalar g = has_gamma ? ly.ln_gamma(i) : Scalar(1);
+                    const Scalar bt = has_beta ? ly.ln_beta(i) : Scalar(0);
+                    pp.buf_ln(i, b) = g * zh + bt;
+                }
+            }
+            mlp_apply_activation_fwd<Scalar>(ly.activation, pp.buf_ln, pp.buf_b);
+            if (ly.residual) {
+                pp.buf_b.noalias() += pp.buf_a;
+            }
+        }
+        pp.buf_a.swap(pp.buf_b);
+    }
+
+    if (data.has_out_norm) {
+        const auto& out_mu = MLPLayerTraits<Scalar>::out_mean(data);
+        const auto& out_sd = MLPLayerTraits<Scalar>::out_std(data);
+        for (Eigen::Index b = 0; b < B; ++b) {
+            for (Eigen::Index i = 0; i < data.d_out; ++i) {
+                Y_out(i, b) = static_cast<double>(out_mu(i) + out_sd(i) * pp.buf_a(i, b));
+            }
+        }
+    } else {
+        Y_out = pp.buf_a.template cast<double>();
+    }
+}
+
+// Vectorized & OpenMP-accelerated activation forward pass
+template <typename Scalar>
+inline void mlp_apply_activation_fwd(NNActivation act,
+                                     const Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& U,
+                                     Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& Hnext) {
+    const Eigen::Index n_tot = U.size();
+    const bool use_omp = (!omp_in_parallel()) && (n_tot >= 16384) && (omp_get_max_threads() > 1);
+    if (act == NNActivation::Identity) {
+        Hnext = U;
+        return;
+    }
+    if (!use_omp) {
+        if (act == NNActivation::Tanh) {
+            Hnext.array() = U.array().tanh();
+            return;
+        }
+        if (act == NNActivation::ReLU) {
+            Hnext.array() = U.array().max(Scalar(0));
+            return;
+        }
+        if (act == NNActivation::Sin) {
+            Hnext.array() = U.array().sin();
+            return;
+        }
+        if (act == NNActivation::SiLU) {
+            // Clamp exponent argument for overflow-free SIMD evaluation
+            auto u = U.array();
+            Hnext.array() = u / (Scalar(1) + (-u).min(Scalar(80)).exp());
+            return;
+        }
+        const Scalar* u_ptr = U.data();
+        Scalar* h_ptr = Hnext.data();
+        for (Eigen::Index i = 0; i < n_tot; ++i) {
+            Scalar y_val, dy_val;
+            nn_act_val_deriv(act, u_ptr[i], y_val, dy_val);
+            h_ptr[i] = y_val;
+        }
+        return;
+    }
+
+    // Parallel SIMD chunks across OpenMP threads for large batches (e.g. 512 x 1024)
+    const int n_threads = omp_get_max_threads();
+    const Eigen::Index chunk = (n_tot + n_threads - 1) / n_threads;
+    const Scalar* u_base = U.data();
+    Scalar* h_base = Hnext.data();
+    #pragma omp parallel for num_threads(n_threads) schedule(static)
+    for (int tid = 0; tid < n_threads; ++tid) {
+        const Eigen::Index i0 = static_cast<Eigen::Index>(tid) * chunk;
+        const Eigen::Index len = std::min(chunk, n_tot - i0);
+        if (len <= 0) continue;
+        Eigen::Map<const Eigen::Array<Scalar, Eigen::Dynamic, 1>> u_seg(u_base + i0, len);
+        Eigen::Map<Eigen::Array<Scalar, Eigen::Dynamic, 1>> h_seg(h_base + i0, len);
+        if (act == NNActivation::Tanh) {
+            h_seg = u_seg.tanh();
+        } else if (act == NNActivation::ReLU) {
+            h_seg = u_seg.max(Scalar(0));
+        } else if (act == NNActivation::Sin) {
+            h_seg = u_seg.sin();
+        } else if (act == NNActivation::SiLU) {
+            h_seg = u_seg / (Scalar(1) + (-u_seg).min(Scalar(80)).exp());
+        } else {
+            for (Eigen::Index k = 0; k < len; ++k) {
+                Scalar y_val, dy_val;
+                nn_act_val_deriv(act, u_base[i0 + k], y_val, dy_val);
+                h_base[i0 + k] = y_val;
+            }
+        }
+    }
+}
+
+template <typename Scalar>
+void mlp_run_primal(const MLPEngineData& data,
+                    const Eigen::Map<const Eigen::MatrixXd>& X_in,
+                    Eigen::Map<Eigen::MatrixXd>& Y_out,
+                    MLPScratch<Scalar>& sc) {
+    const auto& layers = MLPLayerTraits<Scalar>::layers(data);
+    const std::size_t L = layers.size();
+    const Eigen::Index B = X_in.cols();
+    sc.ensure_primal(data, B);
+
+    // Input conversion + optional affine normalization
+    sc.H[0] = X_in.cast<Scalar>();
+    if (data.has_in_norm) {
+        const auto& mu = MLPLayerTraits<Scalar>::in_mean(data);
+        const auto& inv_s = MLPLayerTraits<Scalar>::in_inv_std(data);
+        sc.H[0].colwise() -= mu;
+        sc.H[0].array().colwise() *= inv_s.array();
+    }
+
+    for (std::size_t l = 0; l < L; ++l) {
+        const auto& ly = layers[l];
+        auto& Ul = sc.U[l];
+        auto& Hnext = sc.H[l + 1];
+
+        if (!ly.layer_norm) {
+            // Fast fused path: GEMM directly into Ul, then single-pass (bias + act + residual)
+            mlp_gemv_nobias<Scalar>(ly.W, sc.H[l], Ul);
+            mlp_fused_bias_act_res_fwd<Scalar>(ly.activation, ly.residual, ly.b, Ul, sc.H[l], Hnext);
+        } else {
+            auto& Zl = sc.Z[l];
+            mlp_gemv_add_bias<Scalar>(ly.W, ly.b, sc.H[l], Zl);
+            const Eigen::Index D = ly.d_out;
+            const Scalar inv_D = Scalar(1) / static_cast<Scalar>(D);
+            const bool has_gamma = (ly.ln_gamma.size() == D);
+            const bool has_beta = (ly.ln_beta.size() == D);
+            for (Eigen::Index b = 0; b < B; ++b) {
+                const Scalar mean = Zl.col(b).sum() * inv_D;
+                Scalar var = Scalar(0);
+                for (Eigen::Index i = 0; i < D; ++i) {
+                    const Scalar c = Zl(i, b) - mean;
+                    var += c * c;
+                }
+                var *= inv_D;
+                const Scalar s = Scalar(1) / std::sqrt(var + ly.ln_eps);
+                sc.LN_s[l](b) = s;
+                for (Eigen::Index i = 0; i < D; ++i) {
+                    const Scalar zh = (Zl(i, b) - mean) * s;
+                    sc.LN_zhat[l](i, b) = zh;
+                    const Scalar g = has_gamma ? ly.ln_gamma(i) : Scalar(1);
+                    const Scalar bt = has_beta ? ly.ln_beta(i) : Scalar(0);
+                    Ul(i, b) = g * zh + bt;
+                }
+            }
+            mlp_apply_activation_fwd<Scalar>(ly.activation, Ul, Hnext);
+            if (ly.residual) {
+                Hnext.noalias() += sc.H[l];
+            }
+        }
+    }
+
+    // Output denormalization + write to Y_out
+    if (data.has_out_norm) {
+        const auto& out_mu = MLPLayerTraits<Scalar>::out_mean(data);
+        const auto& out_sd = MLPLayerTraits<Scalar>::out_std(data);
+        for (Eigen::Index b = 0; b < B; ++b) {
+            for (Eigen::Index i = 0; i < data.d_out; ++i) {
+                Y_out(i, b) = static_cast<double>(out_mu(i) + out_sd(i) * sc.H[L](i, b));
+            }
+        }
+    } else {
+        Y_out = sc.H[L].template cast<double>();
+    }
+}
+
+template <typename Scalar>
+void mlp_run_backward(const MLPEngineData& data,
+                      const MLPScratch<Scalar>& primal,
+                      const Eigen::Map<const Eigen::MatrixXd>& Y_bar,
+                      Eigen::Map<Eigen::MatrixXd>& X_bar,
+                      MLPScratch<Scalar>& work) {
+    const auto& layers = MLPLayerTraits<Scalar>::layers(data);
+    const std::size_t L = layers.size();
+    const Eigen::Index B = Y_bar.cols();
+
+    work.bar_cur = Y_bar.cast<Scalar>();
+    if (data.has_out_norm) {
+        const auto& out_sd = MLPLayerTraits<Scalar>::out_std(data);
+        work.bar_cur.array().colwise() *= out_sd.array();
+    }
+
+    for (std::size_t rev = 0; rev < L; ++rev) {
+        const std::size_t l = L - 1 - rev;
+        const auto& ly = layers[l];
+        const auto& Ul = primal.U[l];
+
+        // Vectorized + OpenMP-accelerated Activation VJP: bar_u = bar_cur * phi'(U_l)
+        work.bar_u.resize(ly.d_out, B);
+        mlp_apply_activation_bwd<Scalar>(ly.activation, Ul, work.bar_cur, work.bar_u);
+
+        // LayerNorm VJP: bar_u -> bar_z
+        const auto* bz_mat = &work.bar_u;
+        if (ly.layer_norm) {
+            const Eigen::Index D = ly.d_out;
+            const Scalar inv_D = Scalar(1) / static_cast<Scalar>(D);
+            const bool has_gamma = (ly.ln_gamma.size() == D);
+            work.bar_z.resize(D, B);
+            for (Eigen::Index b = 0; b < B; ++b) {
+                const Scalar s = primal.LN_s[l](b);
+                Scalar mg = Scalar(0);
+                Scalar mgz = Scalar(0);
+                for (Eigen::Index i = 0; i < D; ++i) {
+                    const Scalar g = (has_gamma ? ly.ln_gamma(i) : Scalar(1)) * work.bar_u(i, b);
+                    mg += g;
+                    mgz += g * primal.LN_zhat[l](i, b);
+                }
+                mg *= inv_D;
+                mgz *= inv_D;
+                for (Eigen::Index i = 0; i < D; ++i) {
+                    const Scalar g = (has_gamma ? ly.ln_gamma(i) : Scalar(1)) * work.bar_u(i, b);
+                    work.bar_z(i, b) = s * (g - mg - primal.LN_zhat[l](i, b) * mgz);
+                }
+            }
+            bz_mat = &work.bar_z;
+        }
+
+        // Linear VJP: bar_next = W_l^T * bar_z (+ bar_cur if residual)
+        work.bar_next.resize(ly.d_in, B);
+        mlp_gemv_trans<Scalar>(ly.W, *bz_mat, work.bar_next);
+        if (ly.residual) {
+            work.bar_next.noalias() += work.bar_cur;
+        }
+        work.bar_cur.swap(work.bar_next);
+    }
+
+    if (data.has_in_norm) {
+        const auto& inv_s = MLPLayerTraits<Scalar>::in_inv_std(data);
+        work.bar_cur.array().colwise() *= inv_s.array();
+    }
+    X_bar.noalias() += work.bar_cur.template cast<double>();
+}
+
+template <typename Scalar>
+void mlp_run_tangent(const MLPEngineData& data,
+                     const MLPScratch<Scalar>& primal,
+                     const Eigen::Map<const Eigen::MatrixXd>& X_dot,
+                     Eigen::Map<Eigen::MatrixXd>& Y_dot,
+                     MLPScratch<Scalar>& tang) {
+    const auto& layers = MLPLayerTraits<Scalar>::layers(data);
+    const std::size_t L = layers.size();
+    const Eigen::Index B = X_dot.cols();
+    tang.ensure_tangent(data, B);
+
+    tang.dH[0] = X_dot.cast<Scalar>();
+    if (data.has_in_norm) {
+        const auto& inv_s = MLPLayerTraits<Scalar>::in_inv_std(data);
+        tang.dH[0].array().colwise() *= inv_s.array();
+    }
+
+    for (std::size_t l = 0; l < L; ++l) {
+        const auto& ly = layers[l];
+        auto& dZl = tang.dZ[l];
+        auto& dUl = tang.dU[l];
+        auto& dHnext = tang.dH[l + 1];
+
+        mlp_gemv_nobias<Scalar>(ly.W, tang.dH[l], dZl);
+
+        if (ly.layer_norm) {
+            const Eigen::Index D = ly.d_out;
+            const Scalar inv_D = Scalar(1) / static_cast<Scalar>(D);
+            const bool has_gamma = (ly.ln_gamma.size() == D);
+            for (Eigen::Index b = 0; b < B; ++b) {
+                const Scalar s = primal.LN_s[l](b);
+                const Scalar dmean = dZl.col(b).sum() * inv_D;
+                Scalar p = Scalar(0);
+                for (Eigen::Index i = 0; i < D; ++i) {
+                    p += primal.LN_zhat[l](i, b) * dZl(i, b);
+                }
+                p *= inv_D;
+                tang.LN_p[l](b) = p;
+                for (Eigen::Index i = 0; i < D; ++i) {
+                    const Scalar dzh = s * (dZl(i, b) - dmean - primal.LN_zhat[l](i, b) * p);
+                    tang.LN_dzhat[l](i, b) = dzh;
+                    const Scalar g = has_gamma ? ly.ln_gamma(i) : Scalar(1);
+                    dUl(i, b) = g * dzh;
+                }
+            }
+        } else {
+            dUl = dZl;
+        }
+
+        if (ly.activation == NNActivation::Identity) {
+            dHnext = dUl;
+        } else {
+            const Eigen::Index n_tot = primal.U[l].size();
+            const Scalar* u_ptr = primal.U[l].data();
+            const Scalar* du_ptr = dUl.data();
+            Scalar* dh_ptr = dHnext.data();
+            for (Eigen::Index i = 0; i < n_tot; ++i) {
+                Scalar y_val, dy_val;
+                nn_act_val_deriv(ly.activation, u_ptr[i], y_val, dy_val);
+                dh_ptr[i] = dy_val * du_ptr[i];
+            }
+        }
+
+        if (ly.residual) {
+            dHnext.noalias() += tang.dH[l];
+        }
+    }
+
+    if (data.has_out_norm) {
+        const auto& out_sd = MLPLayerTraits<Scalar>::out_std(data);
+        for (Eigen::Index b = 0; b < B; ++b) {
+            for (Eigen::Index i = 0; i < data.d_out; ++i) {
+                Y_dot(i, b) = static_cast<double>(out_sd(i) * tang.dH[L](i, b));
+            }
+        }
+    } else {
+        Y_dot = tang.dH[L].template cast<double>();
+    }
+}
+
+template <typename Scalar>
+void mlp_run_hessian(const MLPEngineData& data,
+                     const MLPScratch<Scalar>& primal,
+                     const MLPScratch<Scalar>& tang,
+                     const Eigen::Map<const Eigen::MatrixXd>& Y_bar,
+                     const Eigen::Map<const Eigen::MatrixXd>& Y_dbar,
+                     Eigen::Map<Eigen::MatrixXd>& X_dbar,
+                     MLPScratch<Scalar>& work) {
+    const auto& layers = MLPLayerTraits<Scalar>::layers(data);
+    const std::size_t L = layers.size();
+    const Eigen::Index B = Y_bar.cols();
+
+    work.bar_cur = Y_bar.cast<Scalar>();
+    work.dbar_cur = Y_dbar.cast<Scalar>();
+    if (data.has_out_norm) {
+        const auto& out_sd = MLPLayerTraits<Scalar>::out_std(data);
+        work.bar_cur.array().colwise() *= out_sd.array();
+        work.dbar_cur.array().colwise() *= out_sd.array();
+    }
+
+    for (std::size_t rev = 0; rev < L; ++rev) {
+        const std::size_t l = L - 1 - rev;
+        const auto& ly = layers[l];
+        const auto& Ul = primal.U[l];
+        const auto& dUl = tang.dU[l];
+
+        // Activation Forward-over-Reverse:
+        //   bar_u  = bar_cur * phi'(U)
+        //   dbar_u = dbar_cur * phi'(U) + bar_cur * phi''(U) * dU
+        work.bar_u.resize(ly.d_out, B);
+        work.dbar_u.resize(ly.d_out, B);
+        if (ly.activation == NNActivation::Identity) {
+            work.bar_u = work.bar_cur;
+            work.dbar_u = work.dbar_cur;
+        } else {
+            const Eigen::Index n_tot = Ul.size();
+            const Scalar* u_ptr = Ul.data();
+            const Scalar* du_ptr = dUl.data();
+            const Scalar* bc_ptr = work.bar_cur.data();
+            const Scalar* dbc_ptr = work.dbar_cur.data();
+            Scalar* bu_ptr = work.bar_u.data();
+            Scalar* dbu_ptr = work.dbar_u.data();
+            for (Eigen::Index i = 0; i < n_tot; ++i) {
+                Scalar dy_val, d2y_val;
+                nn_act_jet2(ly.activation, u_ptr[i], dy_val, d2y_val);
+                bu_ptr[i] = bc_ptr[i] * dy_val;
+                dbu_ptr[i] = dbc_ptr[i] * dy_val + bc_ptr[i] * d2y_val * du_ptr[i];
+            }
+        }
+
+        // LayerNorm Forward-over-Reverse: (bar_u, dbar_u) -> (bar_z, dbar_z)
+        const auto* bz_mat = &work.bar_u;
+        const auto* dbz_mat = &work.dbar_u;
+        if (ly.layer_norm) {
+            const Eigen::Index D = ly.d_out;
+            const Scalar inv_D = Scalar(1) / static_cast<Scalar>(D);
+            const bool has_gamma = (ly.ln_gamma.size() == D);
+            work.bar_z.resize(D, B);
+            work.dbar_z.resize(D, B);
+            for (Eigen::Index b = 0; b < B; ++b) {
+                const Scalar s = primal.LN_s[l](b);
+                const Scalar p = tang.LN_p[l](b);
+                Scalar mg = Scalar(0), mgz = Scalar(0);
+                Scalar dmg = Scalar(0), dmgz = Scalar(0);
+                for (Eigen::Index i = 0; i < D; ++i) {
+                    const Scalar gam = has_gamma ? ly.ln_gamma(i) : Scalar(1);
+                    const Scalar g = gam * work.bar_u(i, b);
+                    const Scalar dg = gam * work.dbar_u(i, b);
+                    const Scalar zh = primal.LN_zhat[l](i, b);
+                    const Scalar dzh = tang.LN_dzhat[l](i, b);
+                    mg += g;
+                    mgz += g * zh;
+                    dmg += dg;
+                    dmgz += dg * zh + g * dzh;
+                }
+                mg *= inv_D;
+                mgz *= inv_D;
+                dmg *= inv_D;
+                dmgz *= inv_D;
+                for (Eigen::Index i = 0; i < D; ++i) {
+                    const Scalar gam = has_gamma ? ly.ln_gamma(i) : Scalar(1);
+                    const Scalar g = gam * work.bar_u(i, b);
+                    const Scalar dg = gam * work.dbar_u(i, b);
+                    const Scalar zh = primal.LN_zhat[l](i, b);
+                    const Scalar dzh = tang.LN_dzhat[l](i, b);
+                    const Scalar bz = s * (g - mg - zh * mgz);
+                    work.bar_z(i, b) = bz;
+                    work.dbar_z(i, b) = -s * p * bz + s * (dg - dmg - dzh * mgz - zh * dmgz);
+                }
+            }
+            bz_mat = &work.bar_z;
+            dbz_mat = &work.dbar_z;
+        }
+
+        // Linear Forward-over-Reverse
+        work.bar_next.resize(ly.d_in, B);
+        work.dbar_next.resize(ly.d_in, B);
+        mlp_gemv_trans<Scalar>(ly.W, *bz_mat, work.bar_next);
+        mlp_gemv_trans<Scalar>(ly.W, *dbz_mat, work.dbar_next);
+        if (ly.residual) {
+            work.bar_next.noalias() += work.bar_cur;
+            work.dbar_next.noalias() += work.dbar_cur;
+        }
+        work.bar_cur.swap(work.bar_next);
+        work.dbar_cur.swap(work.dbar_next);
+    }
+
+    if (data.has_in_norm) {
+        const auto& inv_s = MLPLayerTraits<Scalar>::in_inv_std(data);
+        work.dbar_cur.array().colwise() *= inv_s.array();
+    }
+    X_dbar.noalias() += work.dbar_cur.template cast<double>();
+}
+
+} // namespace
+
+std::shared_ptr<const MLPEngineData> MLPEngineData::create(
+    const std::vector<MLPLayerSpec>& layers,
+    bool use_float32,
+    const Eigen::VectorXd& in_mean,
+    const Eigen::VectorXd& in_inv_std,
+    const Eigen::VectorXd& out_mean,
+    const Eigen::VectorXd& out_std) {
+    if (layers.empty()) {
+        throw std::invalid_argument("MLP requires at least one layer.");
+    }
+    auto d = std::make_shared<MLPEngineData>();
+    d->use_float32 = use_float32;
+    d->d_in = layers.front().W.cols();
+    d->d_out = layers.back().W.rows();
+
+    Eigen::Index prev_dim = d->d_in;
+    for (std::size_t l = 0; l < layers.size(); ++l) {
+        const auto& spec = layers[l];
+        if (spec.W.rows() <= 0 || spec.W.cols() <= 0) {
+            throw std::invalid_argument("MLP layer weight matrix W must be non-empty.");
+        }
+        if (spec.W.cols() != prev_dim) {
+            throw std::invalid_argument("MLP layer dimension mismatch between consecutive layers.");
+        }
+        if (spec.b.size() != spec.W.rows()) {
+            throw std::invalid_argument("MLP layer bias b size must match W.rows().");
+        }
+        if (spec.residual && spec.W.rows() != spec.W.cols()) {
+            throw std::invalid_argument("MLP residual skip connection requires W.rows() == W.cols().");
+        }
+        if (spec.layer_norm) {
+            if (spec.ln_gamma.size() > 0 && spec.ln_gamma.size() != spec.W.rows()) {
+                throw std::invalid_argument("MLP LayerNorm gamma size must match W.rows().");
+            }
+            if (spec.ln_beta.size() > 0 && spec.ln_beta.size() != spec.W.rows()) {
+                throw std::invalid_argument("MLP LayerNorm beta size must match W.rows().");
+            }
+        }
+        prev_dim = spec.W.rows();
+    }
+
+    if (in_mean.size() > 0 || in_inv_std.size() > 0) {
+        if (in_mean.size() != d->d_in || in_inv_std.size() != d->d_in) {
+            throw std::invalid_argument("MLP in_mean and in_inv_std must both have size d_in.");
+        }
+        d->has_in_norm = true;
+        d->in_mean_d = in_mean;
+        d->in_inv_std_d = in_inv_std;
+        if (use_float32) {
+            d->in_mean_f = in_mean.cast<float>();
+            d->in_inv_std_f = in_inv_std.cast<float>();
+        }
+    }
+    if (out_mean.size() > 0 || out_std.size() > 0) {
+        if (out_mean.size() != d->d_out || out_std.size() != d->d_out) {
+            throw std::invalid_argument("MLP out_mean and out_std must both have size d_out.");
+        }
+        d->has_out_norm = true;
+        d->out_mean_d = out_mean;
+        d->out_std_d = out_std;
+        if (use_float32) {
+            d->out_mean_f = out_mean.cast<float>();
+            d->out_std_f = out_std.cast<float>();
+        }
+    }
+
+    if (use_float32) {
+        d->layers_f.reserve(layers.size());
+        for (const auto& spec : layers) {
+            LayerF lf;
+            lf.W = spec.W.cast<float>();
+            lf.b = spec.b.cast<float>();
+            lf.activation = spec.activation;
+            lf.residual = spec.residual;
+            lf.layer_norm = spec.layer_norm;
+            if (spec.ln_gamma.size() > 0) lf.ln_gamma = spec.ln_gamma.cast<float>();
+            if (spec.ln_beta.size() > 0) lf.ln_beta = spec.ln_beta.cast<float>();
+            lf.ln_eps = static_cast<float>(spec.ln_eps);
+            lf.d_in = spec.W.cols();
+            lf.d_out = spec.W.rows();
+            d->layers_f.push_back(std::move(lf));
+        }
+    } else {
+        d->layers_d.reserve(layers.size());
+        for (const auto& spec : layers) {
+            LayerD ld;
+            ld.W = spec.W;
+            ld.b = spec.b;
+            ld.activation = spec.activation;
+            ld.residual = spec.residual;
+            ld.layer_norm = spec.layer_norm;
+            ld.ln_gamma = spec.ln_gamma;
+            ld.ln_beta = spec.ln_beta;
+            ld.ln_eps = spec.ln_eps;
+            ld.d_in = spec.W.cols();
+            ld.d_out = spec.W.rows();
+            d->layers_d.push_back(std::move(ld));
+        }
+    }
+    return d;
+}
+
+CompiledMLP::CompiledMLP(const std::vector<MLPLayerSpec>& layers,
+                         bool use_float32,
+                         const Eigen::VectorXd& in_mean,
+                         const Eigen::VectorXd& in_inv_std,
+                         const Eigen::VectorXd& out_mean,
+                         const Eigen::VectorXd& out_std,
+                         std::string name_)
+    : data(MLPEngineData::create(layers, use_float32, in_mean, in_inv_std, out_mean, out_std)),
+      name(std::move(name_)) {}
+
+Eigen::MatrixXd CompiledMLP::eval(const Eigen::MatrixXd& X, int num_threads) const {
+    if (X.rows() != data->d_in) {
+        throw std::invalid_argument("CompiledMLP::eval: X.rows() does not match d_in.");
+    }
+    const Eigen::Index B = X.cols();
+    Eigen::MatrixXd Y(data->d_out, B);
+    if (B == 0) return Y;
+
+#if defined(EIGEN_USE_BLAS) || defined(EIGEN_USE_MKL_ALL)
+    // External BLAS (OpenBLAS / Intel MKL) parallelizes large GEMMs internally.
+    // Skip outer OpenMP column chunking to prevent nested thread oversubscription.
+    (void)num_threads;
+    const int max_t = 1;
+    const bool use_omp = false;
+#else
+    const int max_t = (num_threads > 0) ? num_threads : omp_get_max_threads();
+    const bool use_omp = (!omp_in_parallel()) && (max_t > 1) && (B >= 64);
+#endif
+
+    if (!use_omp) {
+        Eigen::Map<const Eigen::MatrixXd> Xm(X.data(), data->d_in, B);
+        Eigen::Map<Eigen::MatrixXd> Ym(Y.data(), data->d_out, B);
+        if (data->use_float32) {
+            static thread_local MLPEvalPingPong<float> pp_f;
+            mlp_run_eval_only<float>(*data, Xm, Ym, pp_f);
+        } else {
+            static thread_local MLPEvalPingPong<double> pp_d;
+            mlp_run_eval_only<double>(*data, Xm, Ym, pp_d);
+        }
+        return Y;
+    }
+
+    const int n_chunks = std::min<int>(max_t, static_cast<int>((B + 31) / 32));
+    const Eigen::Index chunk_sz = (B + n_chunks - 1) / n_chunks;
+    #pragma omp parallel for num_threads(n_chunks) schedule(static)
+    for (int c = 0; c < n_chunks; ++c) {
+        const Eigen::Index col0 = static_cast<Eigen::Index>(c) * chunk_sz;
+        const Eigen::Index cols = std::min(chunk_sz, B - col0);
+        if (cols <= 0) continue;
+        Eigen::Map<const Eigen::MatrixXd> Xm(X.data() + col0 * data->d_in, data->d_in, cols);
+        Eigen::Map<Eigen::MatrixXd> Ym(Y.data() + col0 * data->d_out, data->d_out, cols);
+        if (data->use_float32) {
+            static thread_local MLPEvalPingPong<float> pp_f;
+            mlp_run_eval_only<float>(*data, Xm, Ym, pp_f);
+        } else {
+            static thread_local MLPEvalPingPong<double> pp_d;
+            mlp_run_eval_only<double>(*data, Xm, Ym, pp_d);
+        }
+    }
+    return Y;
+}
+
+struct MLPNode::ScratchD : public MLPScratch<double> {};
+struct MLPNode::ScratchF : public MLPScratch<float> {};
+
+MLPNode::MLPNode(Shape out_shape, int x_id,
+                 std::shared_ptr<const MLPEngineData> engine_data,
+                 std::string name_)
+    : Node(OpType::MLP, out_shape, {x_id}, std::move(name_)),
+      data(std::move(engine_data)),
+      batch_cols(out_shape.cols) {
+    const int n_threads = std::max(1, omp_get_max_threads());
+    if (data->use_float32) {
+        thread_scratch_f_.resize(static_cast<std::size_t>(n_threads));
+    } else {
+        thread_scratch_d_.resize(static_cast<std::size_t>(n_threads));
+    }
+}
+
+MLPNode::ScratchD& MLPNode::ensure_scratch_d(int tid) const {
+    const std::size_t idx = static_cast<std::size_t>(tid);
+    if (idx >= thread_scratch_d_.size()) {
+        #pragma omp critical(fastopt_mlp_scratch)
+        {
+            if (idx >= thread_scratch_d_.size()) {
+                thread_scratch_d_.resize(idx + 1);
+            }
+        }
+    }
+    auto& ptr = thread_scratch_d_[idx];
+    if (!ptr) {
+        ptr = std::make_shared<ScratchD>();
+    }
+    return *ptr;
+}
+
+MLPNode::ScratchF& MLPNode::ensure_scratch_f(int tid) const {
+    const std::size_t idx = static_cast<std::size_t>(tid);
+    if (idx >= thread_scratch_f_.size()) {
+        #pragma omp critical(fastopt_mlp_scratch)
+        {
+            if (idx >= thread_scratch_f_.size()) {
+                thread_scratch_f_.resize(idx + 1);
+            }
+        }
+    }
+    auto& ptr = thread_scratch_f_[idx];
+    if (!ptr) {
+        ptr = std::make_shared<ScratchF>();
+    }
+    return *ptr;
+}
+
+void MLPNode::forward(Workspace& ws) const {
+    const Node& in = graph->node(inputs[0]);
+    const int tid = omp_in_parallel() ? omp_get_thread_num() : 0;
+    Eigen::Map<const Eigen::MatrixXd> Xm(ws.val.data() + in.offset, data->d_in, batch_cols);
+    Eigen::Map<Eigen::MatrixXd> Ym(ws.val.data() + offset, data->d_out, batch_cols);
+
+    if (data->use_float32) {
+        auto& sc = ensure_scratch_f(tid);
+        mlp_run_primal<float>(*data, Xm, Ym, sc);
+        sc.cached_x = ws.val.segment(in.offset, in.size());
+        sc.has_primal = true;
+        sc.has_tangent = false;
+    } else {
+        auto& sc = ensure_scratch_d(tid);
+        mlp_run_primal<double>(*data, Xm, Ym, sc);
+        sc.cached_x = ws.val.segment(in.offset, in.size());
+        sc.has_primal = true;
+        sc.has_tangent = false;
+    }
+}
+
+void MLPNode::backward(Workspace& ws) const {
+    const Node& in = graph->node(inputs[0]);
+    if (!in.requires_grad) return;
+    if (ws.bar.segment(offset, size()).squaredNorm() == 0.0) return;
+
+    const int tid = omp_in_parallel() ? omp_get_thread_num() : 0;
+    const auto x_seg = ws.val.segment(in.offset, in.size());
+    Eigen::Map<const Eigen::MatrixXd> Xm(ws.val.data() + in.offset, data->d_in, batch_cols);
+    Eigen::Map<const Eigen::MatrixXd> Yb(ws.bar.data() + offset, data->d_out, batch_cols);
+    Eigen::Map<Eigen::MatrixXd> Xb(ws.bar.data() + in.offset, data->d_in, batch_cols);
+
+    if (data->use_float32) {
+        auto& sc = ensure_scratch_f(tid);
+        const ScratchF* primal = &sc;
+        if (!(sc.has_primal && sc.cached_x.size() == x_seg.size() && sc.cached_x == x_seg)) {
+            if (tid > 0 && thread_scratch_f_[0] && thread_scratch_f_[0]->has_primal &&
+                thread_scratch_f_[0]->cached_x.size() == x_seg.size() &&
+                thread_scratch_f_[0]->cached_x == x_seg) {
+                primal = thread_scratch_f_[0].get();
+            } else {
+                Eigen::MatrixXd tmp_y(data->d_out, batch_cols);
+                Eigen::Map<Eigen::MatrixXd> Ym(tmp_y.data(), data->d_out, batch_cols);
+                mlp_run_primal<float>(*data, Xm, Ym, sc);
+                sc.cached_x = x_seg;
+                sc.has_primal = true;
+                primal = &sc;
+            }
+        }
+        mlp_run_backward<float>(*data, *primal, Yb, Xb, sc);
+    } else {
+        auto& sc = ensure_scratch_d(tid);
+        const ScratchD* primal = &sc;
+        if (!(sc.has_primal && sc.cached_x.size() == x_seg.size() && sc.cached_x == x_seg)) {
+            if (tid > 0 && thread_scratch_d_[0] && thread_scratch_d_[0]->has_primal &&
+                thread_scratch_d_[0]->cached_x.size() == x_seg.size() &&
+                thread_scratch_d_[0]->cached_x == x_seg) {
+                primal = thread_scratch_d_[0].get();
+            } else {
+                Eigen::MatrixXd tmp_y(data->d_out, batch_cols);
+                Eigen::Map<Eigen::MatrixXd> Ym(tmp_y.data(), data->d_out, batch_cols);
+                mlp_run_primal<double>(*data, Xm, Ym, sc);
+                sc.cached_x = x_seg;
+                sc.has_primal = true;
+                primal = &sc;
+            }
+        }
+        mlp_run_backward<double>(*data, *primal, Yb, Xb, sc);
+    }
+}
+
+void MLPNode::forward_tangent(Workspace& ws) const {
+    const Node& in = graph->node(inputs[0]);
+    if (!in.requires_grad) {
+        ws.dot.segment(offset, size()).setZero();
+        return;
+    }
+
+    const int tid = omp_in_parallel() ? omp_get_thread_num() : 0;
+    const auto x_seg = ws.val.segment(in.offset, in.size());
+    const auto xd_seg = ws.dot.segment(in.offset, in.size());
+    Eigen::Map<const Eigen::MatrixXd> Xm(ws.val.data() + in.offset, data->d_in, batch_cols);
+    Eigen::Map<const Eigen::MatrixXd> Xd(ws.dot.data() + in.offset, data->d_in, batch_cols);
+    Eigen::Map<Eigen::MatrixXd> Yd(ws.dot.data() + offset, data->d_out, batch_cols);
+
+    if (data->use_float32) {
+        auto& sc = ensure_scratch_f(tid);
+        const ScratchF* primal = &sc;
+        if (!(sc.has_primal && sc.cached_x.size() == x_seg.size() && sc.cached_x == x_seg)) {
+            if (tid > 0 && thread_scratch_f_[0] && thread_scratch_f_[0]->has_primal &&
+                thread_scratch_f_[0]->cached_x.size() == x_seg.size() &&
+                thread_scratch_f_[0]->cached_x == x_seg) {
+                primal = thread_scratch_f_[0].get();
+            } else {
+                Eigen::MatrixXd tmp_y(data->d_out, batch_cols);
+                Eigen::Map<Eigen::MatrixXd> Ym(tmp_y.data(), data->d_out, batch_cols);
+                mlp_run_primal<float>(*data, Xm, Ym, sc);
+                sc.cached_x = x_seg;
+                sc.has_primal = true;
+                primal = &sc;
+            }
+        }
+        mlp_run_tangent<float>(*data, *primal, Xd, Yd, sc);
+        sc.cached_xdot = xd_seg;
+        sc.has_tangent = true;
+    } else {
+        auto& sc = ensure_scratch_d(tid);
+        const ScratchD* primal = &sc;
+        if (!(sc.has_primal && sc.cached_x.size() == x_seg.size() && sc.cached_x == x_seg)) {
+            if (tid > 0 && thread_scratch_d_[0] && thread_scratch_d_[0]->has_primal &&
+                thread_scratch_d_[0]->cached_x.size() == x_seg.size() &&
+                thread_scratch_d_[0]->cached_x == x_seg) {
+                primal = thread_scratch_d_[0].get();
+            } else {
+                Eigen::MatrixXd tmp_y(data->d_out, batch_cols);
+                Eigen::Map<Eigen::MatrixXd> Ym(tmp_y.data(), data->d_out, batch_cols);
+                mlp_run_primal<double>(*data, Xm, Ym, sc);
+                sc.cached_x = x_seg;
+                sc.has_primal = true;
+                primal = &sc;
+            }
+        }
+        mlp_run_tangent<double>(*data, *primal, Xd, Yd, sc);
+        sc.cached_xdot = xd_seg;
+        sc.has_tangent = true;
+    }
+}
+
+void MLPNode::backward_hessian(Workspace& ws) const {
+    const Node& in = graph->node(inputs[0]);
+    if (!in.requires_grad) return;
+    if (ws.bar.segment(offset, size()).squaredNorm() == 0.0 &&
+        ws.dot_bar.segment(offset, size()).squaredNorm() == 0.0) {
+        return;
+    }
+
+    const int tid = omp_in_parallel() ? omp_get_thread_num() : 0;
+    const auto x_seg = ws.val.segment(in.offset, in.size());
+    const auto xd_seg = ws.dot.segment(in.offset, in.size());
+    Eigen::Map<const Eigen::MatrixXd> Xm(ws.val.data() + in.offset, data->d_in, batch_cols);
+    Eigen::Map<const Eigen::MatrixXd> Xd(ws.dot.data() + in.offset, data->d_in, batch_cols);
+    Eigen::Map<const Eigen::MatrixXd> Yb(ws.bar.data() + offset, data->d_out, batch_cols);
+    Eigen::Map<const Eigen::MatrixXd> Ydb(ws.dot_bar.data() + offset, data->d_out, batch_cols);
+    Eigen::Map<Eigen::MatrixXd> Xdb(ws.dot_bar.data() + in.offset, data->d_in, batch_cols);
+
+    if (data->use_float32) {
+        auto& sc = ensure_scratch_f(tid);
+        const ScratchF* primal = &sc;
+        if (!(sc.has_primal && sc.cached_x.size() == x_seg.size() && sc.cached_x == x_seg)) {
+            if (tid > 0 && thread_scratch_f_[0] && thread_scratch_f_[0]->has_primal &&
+                thread_scratch_f_[0]->cached_x.size() == x_seg.size() &&
+                thread_scratch_f_[0]->cached_x == x_seg) {
+                primal = thread_scratch_f_[0].get();
+            } else {
+                Eigen::MatrixXd tmp_y(data->d_out, batch_cols);
+                Eigen::Map<Eigen::MatrixXd> Ym(tmp_y.data(), data->d_out, batch_cols);
+                mlp_run_primal<float>(*data, Xm, Ym, sc);
+                sc.cached_x = x_seg;
+                sc.has_primal = true;
+                primal = &sc;
+            }
+        }
+        if (!(sc.has_tangent && sc.cached_xdot.size() == xd_seg.size() && sc.cached_xdot == xd_seg)) {
+            Eigen::MatrixXd tmp_yd(data->d_out, batch_cols);
+            Eigen::Map<Eigen::MatrixXd> Ydm(tmp_yd.data(), data->d_out, batch_cols);
+            mlp_run_tangent<float>(*data, *primal, Xd, Ydm, sc);
+            sc.cached_xdot = xd_seg;
+            sc.has_tangent = true;
+        }
+        mlp_run_hessian<float>(*data, *primal, sc, Yb, Ydb, Xdb, sc);
+    } else {
+        auto& sc = ensure_scratch_d(tid);
+        const ScratchD* primal = &sc;
+        if (!(sc.has_primal && sc.cached_x.size() == x_seg.size() && sc.cached_x == x_seg)) {
+            if (tid > 0 && thread_scratch_d_[0] && thread_scratch_d_[0]->has_primal &&
+                thread_scratch_d_[0]->cached_x.size() == x_seg.size() &&
+                thread_scratch_d_[0]->cached_x == x_seg) {
+                primal = thread_scratch_d_[0].get();
+            } else {
+                Eigen::MatrixXd tmp_y(data->d_out, batch_cols);
+                Eigen::Map<Eigen::MatrixXd> Ym(tmp_y.data(), data->d_out, batch_cols);
+                mlp_run_primal<double>(*data, Xm, Ym, sc);
+                sc.cached_x = x_seg;
+                sc.has_primal = true;
+                primal = &sc;
+            }
+        }
+        if (!(sc.has_tangent && sc.cached_xdot.size() == xd_seg.size() && sc.cached_xdot == xd_seg)) {
+            Eigen::MatrixXd tmp_yd(data->d_out, batch_cols);
+            Eigen::Map<Eigen::MatrixXd> Ydm(tmp_yd.data(), data->d_out, batch_cols);
+            mlp_run_tangent<double>(*data, *primal, Xd, Ydm, sc);
+            sc.cached_xdot = xd_seg;
+            sc.has_tangent = true;
+        }
+        mlp_run_hessian<double>(*data, *primal, sc, Yb, Ydb, Xdb, sc);
+    }
+}
+
+// ============================================================================
+// 19B. Fused Conv1D Implementation (im2col + BLAS3 GEMM + 0/1/2 AD, fp32/fp64)
+// ============================================================================
+namespace {
+
+template <typename Scalar>
+struct Conv1DTraits;
+
+template <>
+struct Conv1DTraits<double> {
+    static const Eigen::MatrixXd& W(const Conv1DEngineData& d) { return d.W_d; }
+    static const Eigen::VectorXd& b(const Conv1DEngineData& d) { return d.b_d; }
+};
+
+template <>
+struct Conv1DTraits<float> {
+    static const Eigen::MatrixXf& W(const Conv1DEngineData& d) { return d.W_f; }
+    static const Eigen::VectorXf& b(const Conv1DEngineData& d) { return d.b_f; }
+};
+
+template <typename Scalar>
+struct Conv1DScratch {
+    using Mat = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>;
+    bool has_primal = false;
+    bool has_tangent = false;
+    Eigen::VectorXd cached_x;
+    Eigen::VectorXd cached_xdot;
+
+    Mat X_buf;
+    Mat Col;
+    Mat Z;
+    Mat dX_buf;
+    Mat dCol;
+    Mat dZ;
+    Mat bar_z;
+    Mat bar_col;
+    Mat bar_x;
+    Mat dbar_z;
+    Mat dbar_col;
+    Mat dbar_x;
+};
+
+template <typename Scalar>
+void im2col_1d(const Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& X,
+               Eigen::Index c_in, Eigen::Index l_in,
+               int K, int S, int P, int D, Eigen::Index l_out,
+               Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& Col) {
+    Col.resize(c_in * K, l_out);
+    Col.setZero();
+    for (Eigen::Index lo = 0; lo < l_out; ++lo) {
+        const Eigen::Index base = lo * S - P;
+        for (int k = 0; k < K; ++k) {
+            const Eigen::Index li = base + static_cast<Eigen::Index>(k) * D;
+            if (li >= 0 && li < l_in) {
+                Col.block(static_cast<Eigen::Index>(k) * c_in, lo, c_in, 1) = X.col(li);
+            }
+        }
+    }
+}
+
+template <typename Scalar>
+void col2im_1d(const Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& dCol,
+               Eigen::Index c_in, Eigen::Index l_in,
+               int K, int S, int P, int D, Eigen::Index l_out,
+               Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& dX) {
+    dX.resize(c_in, l_in);
+    dX.setZero();
+    for (Eigen::Index lo = 0; lo < l_out; ++lo) {
+        const Eigen::Index base = lo * S - P;
+        for (int k = 0; k < K; ++k) {
+            const Eigen::Index li = base + static_cast<Eigen::Index>(k) * D;
+            if (li >= 0 && li < l_in) {
+                dX.col(li).noalias() += dCol.block(static_cast<Eigen::Index>(k) * c_in, lo, c_in, 1);
+            }
+        }
+    }
+}
+
+template <typename Scalar>
+void conv1d_run_primal(const Conv1DEngineData& d, Eigen::Index l_in, Eigen::Index l_out,
+                       const Eigen::Map<const Eigen::MatrixXd>& Xm,
+                       Eigen::Map<Eigen::MatrixXd>& Ym,
+                       Conv1DScratch<Scalar>& sc) {
+    sc.X_buf = Xm.cast<Scalar>();
+    im2col_1d<Scalar>(sc.X_buf, d.c_in, l_in, d.kernel_size, d.stride, d.padding, d.dilation, l_out, sc.Col);
+    sc.Z.resize(d.c_out, l_out);
+    sc.Z.noalias() = Conv1DTraits<Scalar>::W(d) * sc.Col;
+    sc.Z.colwise() += Conv1DTraits<Scalar>::b(d);
+
+    Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic> Y_s(d.c_out, l_out);
+    mlp_apply_activation_fwd<Scalar>(d.activation, sc.Z, Y_s);
+    Ym = Y_s.template cast<double>();
+}
+
+template <typename Scalar>
+void conv1d_run_backward(const Conv1DEngineData& d, Eigen::Index l_in, Eigen::Index l_out,
+                         const Conv1DScratch<Scalar>& primal,
+                         const Eigen::Map<const Eigen::MatrixXd>& Yb,
+                         Eigen::Map<Eigen::MatrixXd>& Xb,
+                         Conv1DScratch<Scalar>& work) {
+    work.bar_z.resize(d.c_out, l_out);
+    Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic> yb_s = Yb.cast<Scalar>();
+    mlp_apply_activation_bwd<Scalar>(d.activation, primal.Z, yb_s, work.bar_z);
+    work.bar_col.resize(d.c_in * d.kernel_size, l_out);
+    work.bar_col.noalias() = Conv1DTraits<Scalar>::W(d).transpose() * work.bar_z;
+    col2im_1d<Scalar>(work.bar_col, d.c_in, l_in, d.kernel_size, d.stride, d.padding, d.dilation, l_out, work.bar_x);
+    Xb.noalias() += work.bar_x.template cast<double>();
+}
+
+template <typename Scalar>
+void conv1d_run_tangent(const Conv1DEngineData& d, Eigen::Index l_in, Eigen::Index l_out,
+                        const Conv1DScratch<Scalar>& primal,
+                        const Eigen::Map<const Eigen::MatrixXd>& Xd,
+                        Eigen::Map<Eigen::MatrixXd>& Yd,
+                        Conv1DScratch<Scalar>& tang) {
+    tang.dX_buf = Xd.cast<Scalar>();
+    im2col_1d<Scalar>(tang.dX_buf, d.c_in, l_in, d.kernel_size, d.stride, d.padding, d.dilation, l_out, tang.dCol);
+    tang.dZ.resize(d.c_out, l_out);
+    tang.dZ.noalias() = Conv1DTraits<Scalar>::W(d) * tang.dCol;
+
+    Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic> yd_s(d.c_out, l_out);
+    mlp_apply_activation_bwd<Scalar>(d.activation, primal.Z, tang.dZ, yd_s);
+    Yd = yd_s.template cast<double>();
+}
+
+template <typename Scalar>
+void conv1d_run_hessian(const Conv1DEngineData& d, Eigen::Index l_in, Eigen::Index l_out,
+                        const Conv1DScratch<Scalar>& primal,
+                        const Conv1DScratch<Scalar>& tang,
+                        const Eigen::Map<const Eigen::MatrixXd>& Yb,
+                        const Eigen::Map<const Eigen::MatrixXd>& Ydb,
+                        Eigen::Map<Eigen::MatrixXd>& Xdb,
+                        Conv1DScratch<Scalar>& work) {
+    const Eigen::Index n_tot = d.c_out * l_out;
+    work.dbar_z.resize(d.c_out, l_out);
+    Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic> yb_s = Yb.cast<Scalar>();
+    Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic> ydb_s = Ydb.cast<Scalar>();
+    const Scalar* z_ptr = primal.Z.data();
+    const Scalar* dz_ptr = tang.dZ.data();
+    const Scalar* yb_ptr = yb_s.data();
+    const Scalar* ydb_ptr = ydb_s.data();
+    Scalar* dbz_ptr = work.dbar_z.data();
+    for (Eigen::Index i = 0; i < n_tot; ++i) {
+        Scalar dy_v, d2y_v;
+        nn_act_jet2(d.activation, z_ptr[i], dy_v, d2y_v);
+        dbz_ptr[i] = ydb_ptr[i] * dy_v + yb_ptr[i] * d2y_v * dz_ptr[i];
+    }
+    work.dbar_col.resize(d.c_in * d.kernel_size, l_out);
+    work.dbar_col.noalias() = Conv1DTraits<Scalar>::W(d).transpose() * work.dbar_z;
+    col2im_1d<Scalar>(work.dbar_col, d.c_in, l_in, d.kernel_size, d.stride, d.padding, d.dilation, l_out, work.dbar_x);
+    Xdb.noalias() += work.dbar_x.template cast<double>();
+}
+
+// ============================================================================
+// 19C. Fused Multi-Head Self-Attention (Exact 0/1/2 AD, fp32/fp64)
+// ============================================================================
+template <typename Scalar>
+struct AttnTraits;
+
+template <>
+struct AttnTraits<double> {
+    using Mat = Eigen::MatrixXd;
+    using Vec = Eigen::VectorXd;
+    static const Mat& Wq(const AttentionEngineData& d) { return d.Wq_d; }
+    static const Mat& Wk(const AttentionEngineData& d) { return d.Wk_d; }
+    static const Mat& Wv(const AttentionEngineData& d) { return d.Wv_d; }
+    static const Mat& Wo(const AttentionEngineData& d) { return d.Wo_d; }
+    static const Vec& bq(const AttentionEngineData& d) { return d.bq_d; }
+    static const Vec& bk(const AttentionEngineData& d) { return d.bk_d; }
+    static const Vec& bv(const AttentionEngineData& d) { return d.bv_d; }
+    static const Vec& bo(const AttentionEngineData& d) { return d.bo_d; }
+};
+
+template <>
+struct AttnTraits<float> {
+    using Mat = Eigen::MatrixXf;
+    using Vec = Eigen::VectorXf;
+    static const Mat& Wq(const AttentionEngineData& d) { return d.Wq_f; }
+    static const Mat& Wk(const AttentionEngineData& d) { return d.Wk_f; }
+    static const Mat& Wv(const AttentionEngineData& d) { return d.Wv_f; }
+    static const Mat& Wo(const AttentionEngineData& d) { return d.Wo_f; }
+    static const Vec& bq(const AttentionEngineData& d) { return d.bq_f; }
+    static const Vec& bk(const AttentionEngineData& d) { return d.bk_f; }
+    static const Vec& bv(const AttentionEngineData& d) { return d.bv_f; }
+    static const Vec& bo(const AttentionEngineData& d) { return d.bo_f; }
+};
+
+template <typename Scalar>
+struct AttnScratch {
+    using Mat = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>;
+    bool has_primal = false;
+    bool has_tangent = false;
+    Eigen::VectorXd cached_x;
+    Eigen::VectorXd cached_xdot;
+
+    Mat Q, K, V, O_cat;
+    std::vector<Mat> P;   // per-head softmax weights (L x L): col j = attention weights for query j
+    Mat dQ, dK, dV;
+    std::vector<Mat> dP;  // per-head tangent softmax weights (L x L)
+};
+
+template <typename Scalar>
+void attn_run_primal(const AttentionEngineData& d, Eigen::Index L,
+                     const Eigen::Map<const Eigen::MatrixXd>& Xm,
+                     Eigen::Map<Eigen::MatrixXd>& Ym,
+                     AttnScratch<Scalar>& sc) {
+    using Mat = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>;
+    const Mat X_s = Xm.cast<Scalar>();
+    const Eigen::Index dm = d.d_model;
+    const Eigen::Index dh = d.d_head;
+    const int H = d.num_heads;
+    const Scalar sc_val = static_cast<Scalar>(d.scale);
+
+    sc.Q.resize(dm, L); sc.Q.noalias() = AttnTraits<Scalar>::Wq(d) * X_s; sc.Q.colwise() += AttnTraits<Scalar>::bq(d);
+    sc.K.resize(dm, L); sc.K.noalias() = AttnTraits<Scalar>::Wk(d) * X_s; sc.K.colwise() += AttnTraits<Scalar>::bk(d);
+    sc.V.resize(dm, L); sc.V.noalias() = AttnTraits<Scalar>::Wv(d) * X_s; sc.V.colwise() += AttnTraits<Scalar>::bv(d);
+    sc.O_cat.resize(dm, L);
+    sc.P.resize(static_cast<std::size_t>(H));
+
+    Mat S(L, L);
+    for (int h = 0; h < H; ++h) {
+        const Eigen::Index r0 = static_cast<Eigen::Index>(h) * dh;
+        auto Qh = sc.Q.middleRows(r0, dh);
+        auto Kh = sc.K.middleRows(r0, dh);
+        auto Vh = sc.V.middleRows(r0, dh);
+        S.noalias() = (Kh.transpose() * Qh) * sc_val; // S(i, j) = <K_i, Q_j> * scale
+        auto& Ph = sc.P[static_cast<std::size_t>(h)];
+        Ph.resize(L, L);
+        for (Eigen::Index j = 0; j < L; ++j) {
+            const Eigen::Index i_lim = d.causal ? (j + 1) : L;
+            Scalar m_val = S(0, j);
+            for (Eigen::Index i = 1; i < i_lim; ++i) m_val = std::max(m_val, S(i, j));
+            Scalar sum_e = Scalar(0);
+            for (Eigen::Index i = 0; i < i_lim; ++i) {
+                const Scalar e = std::exp(S(i, j) - m_val);
+                Ph(i, j) = e;
+                sum_e += e;
+            }
+            const Scalar inv_s = Scalar(1) / sum_e;
+            for (Eigen::Index i = 0; i < i_lim; ++i) Ph(i, j) *= inv_s;
+            for (Eigen::Index i = i_lim; i < L; ++i) Ph(i, j) = Scalar(0);
+        }
+        sc.O_cat.middleRows(r0, dh).noalias() = Vh * Ph;
+    }
+
+    Mat Y_s(dm, L);
+    Y_s.noalias() = AttnTraits<Scalar>::Wo(d) * sc.O_cat;
+    Y_s.colwise() += AttnTraits<Scalar>::bo(d);
+    if (d.residual) Y_s.noalias() += X_s;
+    Ym = Y_s.template cast<double>();
+}
+
+template <typename Scalar>
+void attn_run_backward(const AttentionEngineData& d, Eigen::Index L,
+                       const AttnScratch<Scalar>& primal,
+                       const Eigen::Map<const Eigen::MatrixXd>& Yb,
+                       Eigen::Map<Eigen::MatrixXd>& Xb) {
+    using Mat = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>;
+    const Mat Yb_s = Yb.cast<Scalar>();
+    const Eigen::Index dm = d.d_model;
+    const Eigen::Index dh = d.d_head;
+    const int H = d.num_heads;
+    const Scalar sc_val = static_cast<Scalar>(d.scale);
+
+    Mat O_bar = AttnTraits<Scalar>::Wo(d).transpose() * Yb_s;
+    Mat Q_bar = Mat::Zero(dm, L);
+    Mat K_bar = Mat::Zero(dm, L);
+    Mat V_bar = Mat::Zero(dm, L);
+
+    Mat P_bar(L, L), S_bar(L, L);
+    for (int h = 0; h < H; ++h) {
+        const Eigen::Index r0 = static_cast<Eigen::Index>(h) * dh;
+        const auto Qh = primal.Q.middleRows(r0, dh);
+        const auto Kh = primal.K.middleRows(r0, dh);
+        const auto Vh = primal.V.middleRows(r0, dh);
+        const auto& Ph = primal.P[static_cast<std::size_t>(h)];
+        const auto Oh_bar = O_bar.middleRows(r0, dh);
+
+        V_bar.middleRows(r0, dh).noalias() = Oh_bar * Ph.transpose();
+        P_bar.noalias() = Vh.transpose() * Oh_bar;
+
+        // Softmax VJP per column j: S_bar(i,j) = P(i,j) * (P_bar(i,j) - sum_k P(k,j)*P_bar(k,j))
+        for (Eigen::Index j = 0; j < L; ++j) {
+            const Eigen::Index i_lim = d.causal ? (j + 1) : L;
+            Scalar dot_pb = Scalar(0);
+            for (Eigen::Index i = 0; i < i_lim; ++i) dot_pb += Ph(i, j) * P_bar(i, j);
+            for (Eigen::Index i = 0; i < i_lim; ++i) S_bar(i, j) = Ph(i, j) * (P_bar(i, j) - dot_pb);
+            for (Eigen::Index i = i_lim; i < L; ++i) S_bar(i, j) = Scalar(0);
+        }
+        Q_bar.middleRows(r0, dh).noalias() = (Kh * S_bar) * sc_val;
+        K_bar.middleRows(r0, dh).noalias() = (Qh * S_bar.transpose()) * sc_val;
+    }
+
+    Mat X_bar = AttnTraits<Scalar>::Wq(d).transpose() * Q_bar
+              + AttnTraits<Scalar>::Wk(d).transpose() * K_bar
+              + AttnTraits<Scalar>::Wv(d).transpose() * V_bar;
+    if (d.residual) X_bar.noalias() += Yb_s;
+    Xb.noalias() += X_bar.template cast<double>();
+}
+
+template <typename Scalar>
+void attn_run_tangent(const AttentionEngineData& d, Eigen::Index L,
+                      const AttnScratch<Scalar>& primal,
+                      const Eigen::Map<const Eigen::MatrixXd>& Xd,
+                      Eigen::Map<Eigen::MatrixXd>& Yd,
+                      AttnScratch<Scalar>& tang) {
+    using Mat = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>;
+    const Mat Xd_s = Xd.cast<Scalar>();
+    const Eigen::Index dm = d.d_model;
+    const Eigen::Index dh = d.d_head;
+    const int H = d.num_heads;
+    const Scalar sc_val = static_cast<Scalar>(d.scale);
+
+    tang.dQ.resize(dm, L); tang.dQ.noalias() = AttnTraits<Scalar>::Wq(d) * Xd_s;
+    tang.dK.resize(dm, L); tang.dK.noalias() = AttnTraits<Scalar>::Wk(d) * Xd_s;
+    tang.dV.resize(dm, L); tang.dV.noalias() = AttnTraits<Scalar>::Wv(d) * Xd_s;
+    tang.dP.resize(static_cast<std::size_t>(H));
+
+    Mat dO_cat(dm, L);
+    Mat dS(L, L);
+    for (int h = 0; h < H; ++h) {
+        const Eigen::Index r0 = static_cast<Eigen::Index>(h) * dh;
+        const auto Qh = primal.Q.middleRows(r0, dh);
+        const auto Kh = primal.K.middleRows(r0, dh);
+        const auto Vh = primal.V.middleRows(r0, dh);
+        const auto dQh = tang.dQ.middleRows(r0, dh);
+        const auto dKh = tang.dK.middleRows(r0, dh);
+        const auto dVh = tang.dV.middleRows(r0, dh);
+        const auto& Ph = primal.P[static_cast<std::size_t>(h)];
+
+        dS.noalias() = (dKh.transpose() * Qh + Kh.transpose() * dQh) * sc_val;
+        auto& dPh = tang.dP[static_cast<std::size_t>(h)];
+        dPh.resize(L, L);
+        for (Eigen::Index j = 0; j < L; ++j) {
+            const Eigen::Index i_lim = d.causal ? (j + 1) : L;
+            Scalar dot_ds = Scalar(0);
+            for (Eigen::Index i = 0; i < i_lim; ++i) dot_ds += Ph(i, j) * dS(i, j);
+            for (Eigen::Index i = 0; i < i_lim; ++i) dPh(i, j) = Ph(i, j) * (dS(i, j) - dot_ds);
+            for (Eigen::Index i = i_lim; i < L; ++i) dPh(i, j) = Scalar(0);
+        }
+        dO_cat.middleRows(r0, dh).noalias() = dVh * Ph + Vh * dPh;
+    }
+
+    Mat Yd_s = AttnTraits<Scalar>::Wo(d) * dO_cat;
+    if (d.residual) Yd_s.noalias() += Xd_s;
+    Yd = Yd_s.template cast<double>();
+}
+
+template <typename Scalar>
+void attn_run_hessian(const AttentionEngineData& d, Eigen::Index L,
+                      const AttnScratch<Scalar>& primal,
+                      const AttnScratch<Scalar>& tang,
+                      const Eigen::Map<const Eigen::MatrixXd>& Yb,
+                      const Eigen::Map<const Eigen::MatrixXd>& Ydb,
+                      Eigen::Map<Eigen::MatrixXd>& Xdb) {
+    using Mat = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>;
+    const Mat Yb_s = Yb.cast<Scalar>();
+    const Mat Ydb_s = Ydb.cast<Scalar>();
+    const Eigen::Index dm = d.d_model;
+    const Eigen::Index dh = d.d_head;
+    const int H = d.num_heads;
+    const Scalar sc_val = static_cast<Scalar>(d.scale);
+
+    const Mat O_bar = AttnTraits<Scalar>::Wo(d).transpose() * Yb_s;
+    const Mat O_dbar = AttnTraits<Scalar>::Wo(d).transpose() * Ydb_s;
+
+    Mat Q_dbar = Mat::Zero(dm, L);
+    Mat K_dbar = Mat::Zero(dm, L);
+    Mat V_dbar = Mat::Zero(dm, L);
+
+    Mat P_bar(L, L), P_dbar(L, L), S_bar(L, L), S_dbar(L, L);
+    for (int h = 0; h < H; ++h) {
+        const Eigen::Index r0 = static_cast<Eigen::Index>(h) * dh;
+        const auto Qh = primal.Q.middleRows(r0, dh);
+        const auto Kh = primal.K.middleRows(r0, dh);
+        const auto Vh = primal.V.middleRows(r0, dh);
+        const auto dQh = tang.dQ.middleRows(r0, dh);
+        const auto dKh = tang.dK.middleRows(r0, dh);
+        const auto dVh = tang.dV.middleRows(r0, dh);
+        const auto& Ph = primal.P[static_cast<std::size_t>(h)];
+        const auto& dPh = tang.dP[static_cast<std::size_t>(h)];
+        const auto Oh_bar = O_bar.middleRows(r0, dh);
+        const auto Oh_dbar = O_dbar.middleRows(r0, dh);
+
+        V_dbar.middleRows(r0, dh).noalias() = Oh_dbar * Ph.transpose() + Oh_bar * dPh.transpose();
+        P_bar.noalias() = Vh.transpose() * Oh_bar;
+        P_dbar.noalias() = dVh.transpose() * Oh_bar + Vh.transpose() * Oh_dbar;
+
+        // Forward-over-Reverse exact Softmax Hessian per column j:
+        //   S_bar(i,j)  = P(i,j) * (P_bar(i,j) - mu)
+        //   S_dbar(i,j) = dP(i,j) * (P_bar(i,j) - mu) + P(i,j) * (P_dbar(i,j) - dmu)
+        for (Eigen::Index j = 0; j < L; ++j) {
+            const Eigen::Index i_lim = d.causal ? (j + 1) : L;
+            Scalar mu = Scalar(0), dmu = Scalar(0);
+            for (Eigen::Index i = 0; i < i_lim; ++i) {
+                mu += Ph(i, j) * P_bar(i, j);
+                dmu += dPh(i, j) * P_bar(i, j) + Ph(i, j) * P_dbar(i, j);
+            }
+            for (Eigen::Index i = 0; i < i_lim; ++i) {
+                const Scalar diff = P_bar(i, j) - mu;
+                S_bar(i, j) = Ph(i, j) * diff;
+                S_dbar(i, j) = dPh(i, j) * diff + Ph(i, j) * (P_dbar(i, j) - dmu);
+            }
+            for (Eigen::Index i = i_lim; i < L; ++i) {
+                S_bar(i, j) = Scalar(0);
+                S_dbar(i, j) = Scalar(0);
+            }
+        }
+        Q_dbar.middleRows(r0, dh).noalias() = (dKh * S_bar + Kh * S_dbar) * sc_val;
+        K_dbar.middleRows(r0, dh).noalias() = (dQh * S_bar.transpose() + Qh * S_dbar.transpose()) * sc_val;
+    }
+
+    Mat X_dbar = AttnTraits<Scalar>::Wq(d).transpose() * Q_dbar
+               + AttnTraits<Scalar>::Wk(d).transpose() * K_dbar
+               + AttnTraits<Scalar>::Wv(d).transpose() * V_dbar;
+    if (d.residual) X_dbar.noalias() += Ydb_s;
+    Xdb.noalias() += X_dbar.template cast<double>();
+}
+
+} // namespace
+
+std::shared_ptr<const Conv1DEngineData> Conv1DEngineData::create(
+    const Eigen::MatrixXd& W, const Eigen::VectorXd& b,
+    int c_in_, int kernel_size_, int stride_, int padding_, int dilation_,
+    NNActivation activation_, bool use_float32_) {
+    if (c_in_ <= 0 || kernel_size_ <= 0 || stride_ <= 0 || padding_ < 0 || dilation_ <= 0) {
+        throw std::invalid_argument("Conv1D: invalid convolution hyperparameters.");
+    }
+    if (W.cols() != static_cast<Eigen::Index>(c_in_) * kernel_size_) {
+        throw std::invalid_argument("Conv1D: W.cols() must equal c_in * kernel_size.");
+    }
+    if (b.size() != W.rows()) {
+        throw std::invalid_argument("Conv1D: bias size must equal W.rows() (c_out).");
+    }
+    auto d = std::make_shared<Conv1DEngineData>();
+    d->use_float32 = use_float32_;
+    d->c_in = c_in_;
+    d->c_out = W.rows();
+    d->kernel_size = kernel_size_;
+    d->stride = stride_;
+    d->padding = padding_;
+    d->dilation = dilation_;
+    d->activation = activation_;
+    if (use_float32_) {
+        d->W_f = W.cast<float>();
+        d->b_f = b.cast<float>();
+    } else {
+        d->W_d = W;
+        d->b_d = b;
+    }
+    return d;
+}
+
+CompiledConv1D::CompiledConv1D(const Eigen::MatrixXd& W, const Eigen::VectorXd& b,
+                               int c_in_, int kernel_size_, int stride_, int padding_, int dilation_,
+                               NNActivation activation_, bool use_float32_, std::string name_)
+    : data(Conv1DEngineData::create(W, b, c_in_, kernel_size_, stride_, padding_, dilation_, activation_, use_float32_)),
+      name(std::move(name_)) {}
+
+Eigen::MatrixXd CompiledConv1D::eval(const Eigen::MatrixXd& X) const {
+    if (X.rows() != data->c_in) {
+        throw std::invalid_argument("CompiledConv1D::eval: X.rows() must match c_in.");
+    }
+    const Eigen::Index l_in = X.cols();
+    const Eigen::Index l_out = data->out_length(l_in);
+    Eigen::MatrixXd Y(data->c_out, l_out);
+    Eigen::Map<const Eigen::MatrixXd> Xm(X.data(), data->c_in, l_in);
+    Eigen::Map<Eigen::MatrixXd> Ym(Y.data(), data->c_out, l_out);
+    if (data->use_float32) {
+        static thread_local Conv1DScratch<float> sc;
+        conv1d_run_primal<float>(*data, l_in, l_out, Xm, Ym, sc);
+    } else {
+        static thread_local Conv1DScratch<double> sc;
+        conv1d_run_primal<double>(*data, l_in, l_out, Xm, Ym, sc);
+    }
+    return Y;
+}
+
+struct Conv1DNode::ScratchD : public Conv1DScratch<double> {};
+struct Conv1DNode::ScratchF : public Conv1DScratch<float> {};
+
+Conv1DNode::Conv1DNode(Shape out_shape, int x_id, Eigen::Index l_in_,
+                       std::shared_ptr<const Conv1DEngineData> engine_data,
+                       std::string name_)
+    : Node(OpType::Conv1D, out_shape, {x_id}, std::move(name_)),
+      data(std::move(engine_data)), l_in(l_in_), l_out(out_shape.cols) {
+    const int nt = std::max(1, omp_get_max_threads());
+    if (data->use_float32) thread_scratch_f_.resize(static_cast<std::size_t>(nt));
+    else thread_scratch_d_.resize(static_cast<std::size_t>(nt));
+}
+
+Conv1DNode::ScratchD& Conv1DNode::ensure_scratch_d(int tid) const {
+    const std::size_t idx = static_cast<std::size_t>(tid);
+    if (idx >= thread_scratch_d_.size()) {
+        #pragma omp critical(fastopt_conv1d_scratch)
+        { if (idx >= thread_scratch_d_.size()) thread_scratch_d_.resize(idx + 1); }
+    }
+    if (!thread_scratch_d_[idx]) thread_scratch_d_[idx] = std::make_shared<ScratchD>();
+    return *thread_scratch_d_[idx];
+}
+
+Conv1DNode::ScratchF& Conv1DNode::ensure_scratch_f(int tid) const {
+    const std::size_t idx = static_cast<std::size_t>(tid);
+    if (idx >= thread_scratch_f_.size()) {
+        #pragma omp critical(fastopt_conv1d_scratch)
+        { if (idx >= thread_scratch_f_.size()) thread_scratch_f_.resize(idx + 1); }
+    }
+    if (!thread_scratch_f_[idx]) thread_scratch_f_[idx] = std::make_shared<ScratchF>();
+    return *thread_scratch_f_[idx];
+}
+
+void Conv1DNode::forward(Workspace& ws) const {
+    const Node& in = graph->node(inputs[0]);
+    const int tid = omp_in_parallel() ? omp_get_thread_num() : 0;
+    Eigen::Map<const Eigen::MatrixXd> Xm(ws.val.data() + in.offset, data->c_in, l_in);
+    Eigen::Map<Eigen::MatrixXd> Ym(ws.val.data() + offset, data->c_out, l_out);
+    if (data->use_float32) {
+        auto& sc = ensure_scratch_f(tid);
+        conv1d_run_primal<float>(*data, l_in, l_out, Xm, Ym, sc);
+        sc.cached_x = ws.val.segment(in.offset, in.size());
+        sc.has_primal = true; sc.has_tangent = false;
+    } else {
+        auto& sc = ensure_scratch_d(tid);
+        conv1d_run_primal<double>(*data, l_in, l_out, Xm, Ym, sc);
+        sc.cached_x = ws.val.segment(in.offset, in.size());
+        sc.has_primal = true; sc.has_tangent = false;
+    }
+}
+
+void Conv1DNode::backward(Workspace& ws) const {
+    const Node& in = graph->node(inputs[0]);
+    if (!in.requires_grad || ws.bar.segment(offset, size()).squaredNorm() == 0.0) return;
+    const int tid = omp_in_parallel() ? omp_get_thread_num() : 0;
+    const auto x_seg = ws.val.segment(in.offset, in.size());
+    Eigen::Map<const Eigen::MatrixXd> Xm(ws.val.data() + in.offset, data->c_in, l_in);
+    Eigen::Map<const Eigen::MatrixXd> Yb(ws.bar.data() + offset, data->c_out, l_out);
+    Eigen::Map<Eigen::MatrixXd> Xb(ws.bar.data() + in.offset, data->c_in, l_in);
+    if (data->use_float32) {
+        auto& sc = ensure_scratch_f(tid);
+        const ScratchF* pr = &sc;
+        if (!(sc.has_primal && sc.cached_x == x_seg)) {
+            if (tid > 0 && thread_scratch_f_[0] && thread_scratch_f_[0]->has_primal && thread_scratch_f_[0]->cached_x == x_seg)
+                pr = thread_scratch_f_[0].get();
+            else { Eigen::MatrixXd ty(data->c_out, l_out); Eigen::Map<Eigen::MatrixXd> tym(ty.data(), data->c_out, l_out); conv1d_run_primal<float>(*data, l_in, l_out, Xm, tym, sc); sc.cached_x = x_seg; sc.has_primal = true; }
+        }
+        conv1d_run_backward<float>(*data, l_in, l_out, *pr, Yb, Xb, sc);
+    } else {
+        auto& sc = ensure_scratch_d(tid);
+        const ScratchD* pr = &sc;
+        if (!(sc.has_primal && sc.cached_x == x_seg)) {
+            if (tid > 0 && thread_scratch_d_[0] && thread_scratch_d_[0]->has_primal && thread_scratch_d_[0]->cached_x == x_seg)
+                pr = thread_scratch_d_[0].get();
+            else { Eigen::MatrixXd ty(data->c_out, l_out); Eigen::Map<Eigen::MatrixXd> tym(ty.data(), data->c_out, l_out); conv1d_run_primal<double>(*data, l_in, l_out, Xm, tym, sc); sc.cached_x = x_seg; sc.has_primal = true; }
+        }
+        conv1d_run_backward<double>(*data, l_in, l_out, *pr, Yb, Xb, sc);
+    }
+}
+
+void Conv1DNode::forward_tangent(Workspace& ws) const {
+    const Node& in = graph->node(inputs[0]);
+    if (!in.requires_grad) { ws.dot.segment(offset, size()).setZero(); return; }
+    const int tid = omp_in_parallel() ? omp_get_thread_num() : 0;
+    const auto x_seg = ws.val.segment(in.offset, in.size());
+    const auto xd_seg = ws.dot.segment(in.offset, in.size());
+    Eigen::Map<const Eigen::MatrixXd> Xm(ws.val.data() + in.offset, data->c_in, l_in);
+    Eigen::Map<const Eigen::MatrixXd> Xd(ws.dot.data() + in.offset, data->c_in, l_in);
+    Eigen::Map<Eigen::MatrixXd> Yd(ws.dot.data() + offset, data->c_out, l_out);
+    if (data->use_float32) {
+        auto& sc = ensure_scratch_f(tid);
+        const ScratchF* pr = &sc;
+        if (!(sc.has_primal && sc.cached_x == x_seg)) {
+            if (tid > 0 && thread_scratch_f_[0] && thread_scratch_f_[0]->has_primal && thread_scratch_f_[0]->cached_x == x_seg)
+                pr = thread_scratch_f_[0].get();
+            else { Eigen::MatrixXd ty(data->c_out, l_out); Eigen::Map<Eigen::MatrixXd> tym(ty.data(), data->c_out, l_out); conv1d_run_primal<float>(*data, l_in, l_out, Xm, tym, sc); sc.cached_x = x_seg; sc.has_primal = true; }
+        }
+        conv1d_run_tangent<float>(*data, l_in, l_out, *pr, Xd, Yd, sc);
+        sc.cached_xdot = xd_seg; sc.has_tangent = true;
+    } else {
+        auto& sc = ensure_scratch_d(tid);
+        const ScratchD* pr = &sc;
+        if (!(sc.has_primal && sc.cached_x == x_seg)) {
+            if (tid > 0 && thread_scratch_d_[0] && thread_scratch_d_[0]->has_primal && thread_scratch_d_[0]->cached_x == x_seg)
+                pr = thread_scratch_d_[0].get();
+            else { Eigen::MatrixXd ty(data->c_out, l_out); Eigen::Map<Eigen::MatrixXd> tym(ty.data(), data->c_out, l_out); conv1d_run_primal<double>(*data, l_in, l_out, Xm, tym, sc); sc.cached_x = x_seg; sc.has_primal = true; }
+        }
+        conv1d_run_tangent<double>(*data, l_in, l_out, *pr, Xd, Yd, sc);
+        sc.cached_xdot = xd_seg; sc.has_tangent = true;
+    }
+}
+
+void Conv1DNode::backward_hessian(Workspace& ws) const {
+    const Node& in = graph->node(inputs[0]);
+    if (!in.requires_grad) return;
+    if (ws.bar.segment(offset, size()).squaredNorm() == 0.0 && ws.dot_bar.segment(offset, size()).squaredNorm() == 0.0) return;
+    const int tid = omp_in_parallel() ? omp_get_thread_num() : 0;
+    const auto x_seg = ws.val.segment(in.offset, in.size());
+    const auto xd_seg = ws.dot.segment(in.offset, in.size());
+    Eigen::Map<const Eigen::MatrixXd> Xm(ws.val.data() + in.offset, data->c_in, l_in);
+    Eigen::Map<const Eigen::MatrixXd> Xd(ws.dot.data() + in.offset, data->c_in, l_in);
+    Eigen::Map<const Eigen::MatrixXd> Yb(ws.bar.data() + offset, data->c_out, l_out);
+    Eigen::Map<const Eigen::MatrixXd> Ydb(ws.dot_bar.data() + offset, data->c_out, l_out);
+    Eigen::Map<Eigen::MatrixXd> Xdb(ws.dot_bar.data() + in.offset, data->c_in, l_in);
+    if (data->use_float32) {
+        auto& sc = ensure_scratch_f(tid);
+        const ScratchF* pr = &sc;
+        if (!(sc.has_primal && sc.cached_x == x_seg)) {
+            if (tid > 0 && thread_scratch_f_[0] && thread_scratch_f_[0]->has_primal && thread_scratch_f_[0]->cached_x == x_seg)
+                pr = thread_scratch_f_[0].get();
+            else { Eigen::MatrixXd ty(data->c_out, l_out); Eigen::Map<Eigen::MatrixXd> tym(ty.data(), data->c_out, l_out); conv1d_run_primal<float>(*data, l_in, l_out, Xm, tym, sc); sc.cached_x = x_seg; sc.has_primal = true; }
+        }
+        if (!(sc.has_tangent && sc.cached_xdot == xd_seg)) {
+            Eigen::MatrixXd tyd(data->c_out, l_out); Eigen::Map<Eigen::MatrixXd> tydm(tyd.data(), data->c_out, l_out);
+            conv1d_run_tangent<float>(*data, l_in, l_out, *pr, Xd, tydm, sc); sc.cached_xdot = xd_seg; sc.has_tangent = true;
+        }
+        conv1d_run_hessian<float>(*data, l_in, l_out, *pr, sc, Yb, Ydb, Xdb, sc);
+    } else {
+        auto& sc = ensure_scratch_d(tid);
+        const ScratchD* pr = &sc;
+        if (!(sc.has_primal && sc.cached_x == x_seg)) {
+            if (tid > 0 && thread_scratch_d_[0] && thread_scratch_d_[0]->has_primal && thread_scratch_d_[0]->cached_x == x_seg)
+                pr = thread_scratch_d_[0].get();
+            else { Eigen::MatrixXd ty(data->c_out, l_out); Eigen::Map<Eigen::MatrixXd> tym(ty.data(), data->c_out, l_out); conv1d_run_primal<double>(*data, l_in, l_out, Xm, tym, sc); sc.cached_x = x_seg; sc.has_primal = true; }
+        }
+        if (!(sc.has_tangent && sc.cached_xdot == xd_seg)) {
+            Eigen::MatrixXd tyd(data->c_out, l_out); Eigen::Map<Eigen::MatrixXd> tydm(tyd.data(), data->c_out, l_out);
+            conv1d_run_tangent<double>(*data, l_in, l_out, *pr, Xd, tydm, sc); sc.cached_xdot = xd_seg; sc.has_tangent = true;
+        }
+        conv1d_run_hessian<double>(*data, l_in, l_out, *pr, sc, Yb, Ydb, Xdb, sc);
+    }
+}
+
+std::shared_ptr<const AttentionEngineData> AttentionEngineData::create(
+    const Eigen::MatrixXd& Wq, const Eigen::VectorXd& bq,
+    const Eigen::MatrixXd& Wk, const Eigen::VectorXd& bk,
+    const Eigen::MatrixXd& Wv, const Eigen::VectorXd& bv,
+    const Eigen::MatrixXd& Wo, const Eigen::VectorXd& bo,
+    int num_heads_, bool causal_, bool residual_, bool use_float32_) {
+    const Eigen::Index dm = Wq.rows();
+    if (dm <= 0 || num_heads_ <= 0 || (dm % num_heads_) != 0) {
+        throw std::invalid_argument("Attention: d_model must be positive and divisible by num_heads.");
+    }
+    auto check_mat = [&](const Eigen::MatrixXd& M, const Eigen::VectorXd& v) {
+        if (M.rows() != dm || M.cols() != dm || v.size() != dm) {
+            throw std::invalid_argument("Attention: Wq/Wk/Wv/Wo must be (d_model x d_model) and biases (d_model).");
+        }
+    };
+    check_mat(Wq, bq); check_mat(Wk, bk); check_mat(Wv, bv); check_mat(Wo, bo);
+
+    auto d = std::make_shared<AttentionEngineData>();
+    d->use_float32 = use_float32_;
+    d->d_model = dm;
+    d->num_heads = num_heads_;
+    d->d_head = dm / num_heads_;
+    d->scale = 1.0 / std::sqrt(static_cast<double>(d->d_head));
+    d->causal = causal_;
+    d->residual = residual_;
+    if (use_float32_) {
+        d->Wq_f = Wq.cast<float>(); d->bq_f = bq.cast<float>();
+        d->Wk_f = Wk.cast<float>(); d->bk_f = bk.cast<float>();
+        d->Wv_f = Wv.cast<float>(); d->bv_f = bv.cast<float>();
+        d->Wo_f = Wo.cast<float>(); d->bo_f = bo.cast<float>();
+    } else {
+        d->Wq_d = Wq; d->bq_d = bq;
+        d->Wk_d = Wk; d->bk_d = bk;
+        d->Wv_d = Wv; d->bv_d = bv;
+        d->Wo_d = Wo; d->bo_d = bo;
+    }
+    return d;
+}
+
+CompiledAttention::CompiledAttention(
+    const Eigen::MatrixXd& Wq, const Eigen::VectorXd& bq,
+    const Eigen::MatrixXd& Wk, const Eigen::VectorXd& bk,
+    const Eigen::MatrixXd& Wv, const Eigen::VectorXd& bv,
+    const Eigen::MatrixXd& Wo, const Eigen::VectorXd& bo,
+    int num_heads_, bool causal_, bool residual_, bool use_float32_, std::string name_)
+    : data(AttentionEngineData::create(Wq, bq, Wk, bk, Wv, bv, Wo, bo, num_heads_, causal_, residual_, use_float32_)),
+      name(std::move(name_)) {}
+
+Eigen::MatrixXd CompiledAttention::eval(const Eigen::MatrixXd& X) const {
+    if (X.rows() != data->d_model) {
+        throw std::invalid_argument("CompiledAttention::eval: X.rows() must match d_model.");
+    }
+    const Eigen::Index L = X.cols();
+    Eigen::MatrixXd Y(data->d_model, L);
+    Eigen::Map<const Eigen::MatrixXd> Xm(X.data(), data->d_model, L);
+    Eigen::Map<Eigen::MatrixXd> Ym(Y.data(), data->d_model, L);
+    if (data->use_float32) {
+        static thread_local AttnScratch<float> sc;
+        attn_run_primal<float>(*data, L, Xm, Ym, sc);
+    } else {
+        static thread_local AttnScratch<double> sc;
+        attn_run_primal<double>(*data, L, Xm, Ym, sc);
+    }
+    return Y;
+}
+
+struct AttentionNode::ScratchD : public AttnScratch<double> {};
+struct AttentionNode::ScratchF : public AttnScratch<float> {};
+
+AttentionNode::AttentionNode(Shape out_shape, int x_id,
+                             std::shared_ptr<const AttentionEngineData> engine_data,
+                             std::string name_)
+    : Node(OpType::Attention, out_shape, {x_id}, std::move(name_)),
+      data(std::move(engine_data)), seq_len(out_shape.cols) {
+    const int nt = std::max(1, omp_get_max_threads());
+    if (data->use_float32) thread_scratch_f_.resize(static_cast<std::size_t>(nt));
+    else thread_scratch_d_.resize(static_cast<std::size_t>(nt));
+}
+
+AttentionNode::ScratchD& AttentionNode::ensure_scratch_d(int tid) const {
+    const std::size_t idx = static_cast<std::size_t>(tid);
+    if (idx >= thread_scratch_d_.size()) {
+        #pragma omp critical(fastopt_attn_scratch)
+        { if (idx >= thread_scratch_d_.size()) thread_scratch_d_.resize(idx + 1); }
+    }
+    if (!thread_scratch_d_[idx]) thread_scratch_d_[idx] = std::make_shared<ScratchD>();
+    return *thread_scratch_d_[idx];
+}
+
+AttentionNode::ScratchF& AttentionNode::ensure_scratch_f(int tid) const {
+    const std::size_t idx = static_cast<std::size_t>(tid);
+    if (idx >= thread_scratch_f_.size()) {
+        #pragma omp critical(fastopt_attn_scratch)
+        { if (idx >= thread_scratch_f_.size()) thread_scratch_f_.resize(idx + 1); }
+    }
+    if (!thread_scratch_f_[idx]) thread_scratch_f_[idx] = std::make_shared<ScratchF>();
+    return *thread_scratch_f_[idx];
+}
+
+void AttentionNode::forward(Workspace& ws) const {
+    const Node& in = graph->node(inputs[0]);
+    const int tid = omp_in_parallel() ? omp_get_thread_num() : 0;
+    Eigen::Map<const Eigen::MatrixXd> Xm(ws.val.data() + in.offset, data->d_model, seq_len);
+    Eigen::Map<Eigen::MatrixXd> Ym(ws.val.data() + offset, data->d_model, seq_len);
+    if (data->use_float32) {
+        auto& sc = ensure_scratch_f(tid);
+        attn_run_primal<float>(*data, seq_len, Xm, Ym, sc);
+        sc.cached_x = ws.val.segment(in.offset, in.size());
+        sc.has_primal = true; sc.has_tangent = false;
+    } else {
+        auto& sc = ensure_scratch_d(tid);
+        attn_run_primal<double>(*data, seq_len, Xm, Ym, sc);
+        sc.cached_x = ws.val.segment(in.offset, in.size());
+        sc.has_primal = true; sc.has_tangent = false;
+    }
+}
+
+void AttentionNode::backward(Workspace& ws) const {
+    const Node& in = graph->node(inputs[0]);
+    if (!in.requires_grad || ws.bar.segment(offset, size()).squaredNorm() == 0.0) return;
+    const int tid = omp_in_parallel() ? omp_get_thread_num() : 0;
+    const auto x_seg = ws.val.segment(in.offset, in.size());
+    Eigen::Map<const Eigen::MatrixXd> Xm(ws.val.data() + in.offset, data->d_model, seq_len);
+    Eigen::Map<const Eigen::MatrixXd> Yb(ws.bar.data() + offset, data->d_model, seq_len);
+    Eigen::Map<Eigen::MatrixXd> Xb(ws.bar.data() + in.offset, data->d_model, seq_len);
+    if (data->use_float32) {
+        auto& sc = ensure_scratch_f(tid);
+        const ScratchF* pr = &sc;
+        if (!(sc.has_primal && sc.cached_x == x_seg)) {
+            if (tid > 0 && thread_scratch_f_[0] && thread_scratch_f_[0]->has_primal && thread_scratch_f_[0]->cached_x == x_seg)
+                pr = thread_scratch_f_[0].get();
+            else { Eigen::MatrixXd ty(data->d_model, seq_len); Eigen::Map<Eigen::MatrixXd> tym(ty.data(), data->d_model, seq_len); attn_run_primal<float>(*data, seq_len, Xm, tym, sc); sc.cached_x = x_seg; sc.has_primal = true; }
+        }
+        attn_run_backward<float>(*data, seq_len, *pr, Yb, Xb);
+    } else {
+        auto& sc = ensure_scratch_d(tid);
+        const ScratchD* pr = &sc;
+        if (!(sc.has_primal && sc.cached_x == x_seg)) {
+            if (tid > 0 && thread_scratch_d_[0] && thread_scratch_d_[0]->has_primal && thread_scratch_d_[0]->cached_x == x_seg)
+                pr = thread_scratch_d_[0].get();
+            else { Eigen::MatrixXd ty(data->d_model, seq_len); Eigen::Map<Eigen::MatrixXd> tym(ty.data(), data->d_model, seq_len); attn_run_primal<double>(*data, seq_len, Xm, tym, sc); sc.cached_x = x_seg; sc.has_primal = true; }
+        }
+        attn_run_backward<double>(*data, seq_len, *pr, Yb, Xb);
+    }
+}
+
+void AttentionNode::forward_tangent(Workspace& ws) const {
+    const Node& in = graph->node(inputs[0]);
+    if (!in.requires_grad) { ws.dot.segment(offset, size()).setZero(); return; }
+    const int tid = omp_in_parallel() ? omp_get_thread_num() : 0;
+    const auto x_seg = ws.val.segment(in.offset, in.size());
+    const auto xd_seg = ws.dot.segment(in.offset, in.size());
+    Eigen::Map<const Eigen::MatrixXd> Xm(ws.val.data() + in.offset, data->d_model, seq_len);
+    Eigen::Map<const Eigen::MatrixXd> Xd(ws.dot.data() + in.offset, data->d_model, seq_len);
+    Eigen::Map<Eigen::MatrixXd> Yd(ws.dot.data() + offset, data->d_model, seq_len);
+    if (data->use_float32) {
+        auto& sc = ensure_scratch_f(tid);
+        const ScratchF* pr = &sc;
+        if (!(sc.has_primal && sc.cached_x == x_seg)) {
+            if (tid > 0 && thread_scratch_f_[0] && thread_scratch_f_[0]->has_primal && thread_scratch_f_[0]->cached_x == x_seg)
+                pr = thread_scratch_f_[0].get();
+            else { Eigen::MatrixXd ty(data->d_model, seq_len); Eigen::Map<Eigen::MatrixXd> tym(ty.data(), data->d_model, seq_len); attn_run_primal<float>(*data, seq_len, Xm, tym, sc); sc.cached_x = x_seg; sc.has_primal = true; }
+        }
+        attn_run_tangent<float>(*data, seq_len, *pr, Xd, Yd, sc);
+        sc.cached_xdot = xd_seg; sc.has_tangent = true;
+    } else {
+        auto& sc = ensure_scratch_d(tid);
+        const ScratchD* pr = &sc;
+        if (!(sc.has_primal && sc.cached_x == x_seg)) {
+            if (tid > 0 && thread_scratch_d_[0] && thread_scratch_d_[0]->has_primal && thread_scratch_d_[0]->cached_x == x_seg)
+                pr = thread_scratch_d_[0].get();
+            else { Eigen::MatrixXd ty(data->d_model, seq_len); Eigen::Map<Eigen::MatrixXd> tym(ty.data(), data->d_model, seq_len); attn_run_primal<double>(*data, seq_len, Xm, tym, sc); sc.cached_x = x_seg; sc.has_primal = true; }
+        }
+        attn_run_tangent<double>(*data, seq_len, *pr, Xd, Yd, sc);
+        sc.cached_xdot = xd_seg; sc.has_tangent = true;
+    }
+}
+
+void AttentionNode::backward_hessian(Workspace& ws) const {
+    const Node& in = graph->node(inputs[0]);
+    if (!in.requires_grad) return;
+    if (ws.bar.segment(offset, size()).squaredNorm() == 0.0 && ws.dot_bar.segment(offset, size()).squaredNorm() == 0.0) return;
+    const int tid = omp_in_parallel() ? omp_get_thread_num() : 0;
+    const auto x_seg = ws.val.segment(in.offset, in.size());
+    const auto xd_seg = ws.dot.segment(in.offset, in.size());
+    Eigen::Map<const Eigen::MatrixXd> Xm(ws.val.data() + in.offset, data->d_model, seq_len);
+    Eigen::Map<const Eigen::MatrixXd> Xd(ws.dot.data() + in.offset, data->d_model, seq_len);
+    Eigen::Map<const Eigen::MatrixXd> Yb(ws.bar.data() + offset, data->d_model, seq_len);
+    Eigen::Map<const Eigen::MatrixXd> Ydb(ws.dot_bar.data() + offset, data->d_model, seq_len);
+    Eigen::Map<Eigen::MatrixXd> Xdb(ws.dot_bar.data() + in.offset, data->d_model, seq_len);
+    if (data->use_float32) {
+        auto& sc = ensure_scratch_f(tid);
+        const ScratchF* pr = &sc;
+        if (!(sc.has_primal && sc.cached_x == x_seg)) {
+            if (tid > 0 && thread_scratch_f_[0] && thread_scratch_f_[0]->has_primal && thread_scratch_f_[0]->cached_x == x_seg)
+                pr = thread_scratch_f_[0].get();
+            else { Eigen::MatrixXd ty(data->d_model, seq_len); Eigen::Map<Eigen::MatrixXd> tym(ty.data(), data->d_model, seq_len); attn_run_primal<float>(*data, seq_len, Xm, tym, sc); sc.cached_x = x_seg; sc.has_primal = true; }
+        }
+        if (!(sc.has_tangent && sc.cached_xdot == xd_seg)) {
+            Eigen::MatrixXd tyd(data->d_model, seq_len); Eigen::Map<Eigen::MatrixXd> tydm(tyd.data(), data->d_model, seq_len);
+            attn_run_tangent<float>(*data, seq_len, *pr, Xd, tydm, sc); sc.cached_xdot = xd_seg; sc.has_tangent = true;
+        }
+        attn_run_hessian<float>(*data, seq_len, *pr, sc, Yb, Ydb, Xdb);
+    } else {
+        auto& sc = ensure_scratch_d(tid);
+        const ScratchD* pr = &sc;
+        if (!(sc.has_primal && sc.cached_x == x_seg)) {
+            if (tid > 0 && thread_scratch_d_[0] && thread_scratch_d_[0]->has_primal && thread_scratch_d_[0]->cached_x == x_seg)
+                pr = thread_scratch_d_[0].get();
+            else { Eigen::MatrixXd ty(data->d_model, seq_len); Eigen::Map<Eigen::MatrixXd> tym(ty.data(), data->d_model, seq_len); attn_run_primal<double>(*data, seq_len, Xm, tym, sc); sc.cached_x = x_seg; sc.has_primal = true; }
+        }
+        if (!(sc.has_tangent && sc.cached_xdot == xd_seg)) {
+            Eigen::MatrixXd tyd(data->d_model, seq_len); Eigen::Map<Eigen::MatrixXd> tydm(tyd.data(), data->d_model, seq_len);
+            attn_run_tangent<double>(*data, seq_len, *pr, Xd, tydm, sc); sc.cached_xdot = xd_seg; sc.has_tangent = true;
+        }
+        attn_run_hessian<double>(*data, seq_len, *pr, sc, Yb, Ydb, Xdb);
+    }
+}
+
+// ============================================================================
+// 19D. Fused Conv2D, Pool2D, and RMSNorm Implementations (0/1/2 AD)
+// ============================================================================
+namespace {
+
+template <typename Scalar>
+struct Conv2DTraits;
+template <>
+struct Conv2DTraits<double> {
+    static const Eigen::MatrixXd& W(const Conv2DEngineData& d) { return d.W_d; }
+    static const Eigen::VectorXd& b(const Conv2DEngineData& d) { return d.b_d; }
+};
+template <>
+struct Conv2DTraits<float> {
+    static const Eigen::MatrixXf& W(const Conv2DEngineData& d) { return d.W_f; }
+    static const Eigen::VectorXf& b(const Conv2DEngineData& d) { return d.b_f; }
+};
+
+template <typename Scalar>
+struct Conv2DScratch {
+    using Mat = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>;
+    bool has_primal = false;
+    bool has_tangent = false;
+    Eigen::VectorXd cached_x;
+    Eigen::VectorXd cached_xdot;
+    Mat X_buf, Col, Z, dX_buf, dCol, dZ, bar_z, bar_col, bar_x, dbar_z, dbar_col, dbar_x;
+};
+
+template <typename Scalar>
+void im2col_2d(const Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& X,
+               Eigen::Index c_in, int h_in, int w_in,
+               int kh, int kw, int sh, int sw, int ph, int pw, int dh, int dw,
+               int h_out, int w_out,
+               Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& Col) {
+    Col.resize(c_in * kh * kw, static_cast<Eigen::Index>(h_out) * w_out);
+    Col.setZero();
+    for (int ho = 0; ho < h_out; ++ho) {
+        for (int wo = 0; wo < w_out; ++wo) {
+            const Eigen::Index col_idx = static_cast<Eigen::Index>(ho) * w_out + wo;
+            int k_idx = 0;
+            for (int r = 0; r < kh; ++r) {
+                const int hi = ho * sh - ph + r * dh;
+                for (int c = 0; c < kw; ++c) {
+                    const int wi = wo * sw - pw + c * dw;
+                    if (hi >= 0 && hi < h_in && wi >= 0 && wi < w_in) {
+                        const Eigen::Index in_col = static_cast<Eigen::Index>(hi) * w_in + wi;
+                        Col.block(static_cast<Eigen::Index>(k_idx) * c_in, col_idx, c_in, 1) = X.col(in_col);
+                    }
+                    ++k_idx;
+                }
+            }
+        }
+    }
+}
+
+template <typename Scalar>
+void col2im_2d(const Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& dCol,
+               Eigen::Index c_in, int h_in, int w_in,
+               int kh, int kw, int sh, int sw, int ph, int pw, int dh, int dw,
+               int h_out, int w_out,
+               Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& dX) {
+    dX.resize(c_in, static_cast<Eigen::Index>(h_in) * w_in);
+    dX.setZero();
+    for (int ho = 0; ho < h_out; ++ho) {
+        for (int wo = 0; wo < w_out; ++wo) {
+            const Eigen::Index col_idx = static_cast<Eigen::Index>(ho) * w_out + wo;
+            int k_idx = 0;
+            for (int r = 0; r < kh; ++r) {
+                const int hi = ho * sh - ph + r * dh;
+                for (int c = 0; c < kw; ++c) {
+                    const int wi = wo * sw - pw + c * dw;
+                    if (hi >= 0 && hi < h_in && wi >= 0 && wi < w_in) {
+                        const Eigen::Index in_col = static_cast<Eigen::Index>(hi) * w_in + wi;
+                        dX.col(in_col).noalias() += dCol.block(static_cast<Eigen::Index>(k_idx) * c_in, col_idx, c_in, 1);
+                    }
+                    ++k_idx;
+                }
+            }
+        }
+    }
+}
+
+template <typename Scalar>
+void conv2d_run_primal(const Conv2DEngineData& d, int h_in, int w_in, int h_out, int w_out,
+                       const Eigen::Map<const Eigen::MatrixXd>& Xm,
+                       Eigen::Map<Eigen::MatrixXd>& Ym, Conv2DScratch<Scalar>& sc) {
+    sc.X_buf = Xm.cast<Scalar>();
+    im2col_2d<Scalar>(sc.X_buf, d.c_in, h_in, w_in, d.kh, d.kw, d.sh, d.sw, d.ph, d.pw, d.dh, d.dw, h_out, w_out, sc.Col);
+    const Eigen::Index s_out = static_cast<Eigen::Index>(h_out) * w_out;
+    sc.Z.resize(d.c_out, s_out);
+    sc.Z.noalias() = Conv2DTraits<Scalar>::W(d) * sc.Col;
+    sc.Z.colwise() += Conv2DTraits<Scalar>::b(d);
+    Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic> Y_s(d.c_out, s_out);
+    mlp_apply_activation_fwd<Scalar>(d.activation, sc.Z, Y_s);
+    Ym = Y_s.template cast<double>();
+}
+
+template <typename Scalar>
+void conv2d_run_backward(const Conv2DEngineData& d, int h_in, int w_in, int h_out, int w_out,
+                         const Conv2DScratch<Scalar>& primal,
+                         const Eigen::Map<const Eigen::MatrixXd>& Yb,
+                         Eigen::Map<Eigen::MatrixXd>& Xb, Conv2DScratch<Scalar>& work) {
+    const Eigen::Index s_out = static_cast<Eigen::Index>(h_out) * w_out;
+    work.bar_z.resize(d.c_out, s_out);
+    Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic> yb_s = Yb.cast<Scalar>();
+    mlp_apply_activation_bwd<Scalar>(d.activation, primal.Z, yb_s, work.bar_z);
+    work.bar_col.resize(d.c_in * d.kh * d.kw, s_out);
+    work.bar_col.noalias() = Conv2DTraits<Scalar>::W(d).transpose() * work.bar_z;
+    col2im_2d<Scalar>(work.bar_col, d.c_in, h_in, w_in, d.kh, d.kw, d.sh, d.sw, d.ph, d.pw, d.dh, d.dw, h_out, w_out, work.bar_x);
+    Xb.noalias() += work.bar_x.template cast<double>();
+}
+
+template <typename Scalar>
+void conv2d_run_tangent(const Conv2DEngineData& d, int h_in, int w_in, int h_out, int w_out,
+                        const Conv2DScratch<Scalar>& primal,
+                        const Eigen::Map<const Eigen::MatrixXd>& Xd,
+                        Eigen::Map<Eigen::MatrixXd>& Yd, Conv2DScratch<Scalar>& tang) {
+    const Eigen::Index s_out = static_cast<Eigen::Index>(h_out) * w_out;
+    tang.dX_buf = Xd.cast<Scalar>();
+    im2col_2d<Scalar>(tang.dX_buf, d.c_in, h_in, w_in, d.kh, d.kw, d.sh, d.sw, d.ph, d.pw, d.dh, d.dw, h_out, w_out, tang.dCol);
+    tang.dZ.resize(d.c_out, s_out);
+    tang.dZ.noalias() = Conv2DTraits<Scalar>::W(d) * tang.dCol;
+    Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic> yd_s(d.c_out, s_out);
+    mlp_apply_activation_bwd<Scalar>(d.activation, primal.Z, tang.dZ, yd_s);
+    Yd = yd_s.template cast<double>();
+}
+
+template <typename Scalar>
+void conv2d_run_hessian(const Conv2DEngineData& d, int h_in, int w_in, int h_out, int w_out,
+                        const Conv2DScratch<Scalar>& primal, const Conv2DScratch<Scalar>& tang,
+                        const Eigen::Map<const Eigen::MatrixXd>& Yb,
+                        const Eigen::Map<const Eigen::MatrixXd>& Ydb,
+                        Eigen::Map<Eigen::MatrixXd>& Xdb, Conv2DScratch<Scalar>& work) {
+    const Eigen::Index s_out = static_cast<Eigen::Index>(h_out) * w_out;
+    const Eigen::Index n_tot = d.c_out * s_out;
+    work.dbar_z.resize(d.c_out, s_out);
+    Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic> yb_s = Yb.cast<Scalar>();
+    Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic> ydb_s = Ydb.cast<Scalar>();
+    const Scalar* zp = primal.Z.data();
+    const Scalar* dzp = tang.dZ.data();
+    const Scalar* ybp = yb_s.data();
+    const Scalar* ydbp = ydb_s.data();
+    Scalar* dbzp = work.dbar_z.data();
+    for (Eigen::Index i = 0; i < n_tot; ++i) {
+        Scalar dy_v, d2y_v;
+        nn_act_jet2(d.activation, zp[i], dy_v, d2y_v);
+        dbzp[i] = ydbp[i] * dy_v + ybp[i] * d2y_v * dzp[i];
+    }
+    work.dbar_col.resize(d.c_in * d.kh * d.kw, s_out);
+    work.dbar_col.noalias() = Conv2DTraits<Scalar>::W(d).transpose() * work.dbar_z;
+    col2im_2d<Scalar>(work.dbar_col, d.c_in, h_in, w_in, d.kh, d.kw, d.sh, d.sw, d.ph, d.pw, d.dh, d.dw, h_out, w_out, work.dbar_x);
+    Xdb.noalias() += work.dbar_x.template cast<double>();
+}
+
+} // namespace
+
+std::shared_ptr<const Conv2DEngineData> Conv2DEngineData::create(
+    const Eigen::MatrixXd& W, const Eigen::VectorXd& b,
+    int c_in_, int kh_, int kw_, int sh_, int sw_, int ph_, int pw_, int dh_, int dw_,
+    NNActivation activation_, bool use_float32_) {
+    if (c_in_ <= 0 || kh_ <= 0 || kw_ <= 0 || sh_ <= 0 || sw_ <= 0 || ph_ < 0 || pw_ < 0 || dh_ <= 0 || dw_ <= 0)
+        throw std::invalid_argument("Conv2D: invalid hyperparameters.");
+    if (W.cols() != static_cast<Eigen::Index>(c_in_) * kh_ * kw_)
+        throw std::invalid_argument("Conv2D: W.cols() must equal c_in * kh * kw.");
+    if (b.size() != W.rows())
+        throw std::invalid_argument("Conv2D: bias size must equal W.rows() (c_out).");
+    auto d = std::make_shared<Conv2DEngineData>();
+    d->use_float32 = use_float32_;
+    d->c_in = c_in_; d->c_out = W.rows();
+    d->kh = kh_; d->kw = kw_; d->sh = sh_; d->sw = sw_;
+    d->ph = ph_; d->pw = pw_; d->dh = dh_; d->dw = dw_;
+    d->activation = activation_;
+    if (use_float32_) { d->W_f = W.cast<float>(); d->b_f = b.cast<float>(); }
+    else { d->W_d = W; d->b_d = b; }
+    return d;
+}
+
+CompiledConv2D::CompiledConv2D(const Eigen::MatrixXd& W, const Eigen::VectorXd& b,
+                               int c_in_, int kh_, int kw_, int sh_, int sw_, int ph_, int pw_, int dh_, int dw_,
+                               NNActivation activation_, bool use_float32_, std::string name_)
+    : data(Conv2DEngineData::create(W, b, c_in_, kh_, kw_, sh_, sw_, ph_, pw_, dh_, dw_, activation_, use_float32_)),
+      name(std::move(name_)) {}
+
+Eigen::MatrixXd CompiledConv2D::eval(const Eigen::MatrixXd& X, int h_in_, int w_in_) const {
+    if (X.rows() != data->c_in || X.cols() != static_cast<Eigen::Index>(h_in_) * w_in_)
+        throw std::invalid_argument("CompiledConv2D::eval: X shape must be (c_in, h_in * w_in).");
+    auto [ho, wo] = data->out_hw(h_in_, w_in_);
+    Eigen::MatrixXd Y(data->c_out, static_cast<Eigen::Index>(ho) * wo);
+    Eigen::Map<const Eigen::MatrixXd> Xm(X.data(), data->c_in, X.cols());
+    Eigen::Map<Eigen::MatrixXd> Ym(Y.data(), data->c_out, Y.cols());
+    if (data->use_float32) {
+        static thread_local Conv2DScratch<float> sc;
+        conv2d_run_primal<float>(*data, h_in_, w_in_, ho, wo, Xm, Ym, sc);
+    } else {
+        static thread_local Conv2DScratch<double> sc;
+        conv2d_run_primal<double>(*data, h_in_, w_in_, ho, wo, Xm, Ym, sc);
+    }
+    return Y;
+}
+
+struct Conv2DNode::ScratchD : public Conv2DScratch<double> {};
+struct Conv2DNode::ScratchF : public Conv2DScratch<float> {};
+
+Conv2DNode::Conv2DNode(Shape out_shape, int x_id, int h_in_, int w_in_, int h_out_, int w_out_,
+                       std::shared_ptr<const Conv2DEngineData> engine_data, std::string name_)
+    : Node(OpType::Conv2D, out_shape, {x_id}, std::move(name_)),
+      data(std::move(engine_data)), h_in(h_in_), w_in(w_in_), h_out(h_out_), w_out(w_out_) {
+    const int nt = std::max(1, omp_get_max_threads());
+    if (data->use_float32) thread_scratch_f_.resize(static_cast<std::size_t>(nt));
+    else thread_scratch_d_.resize(static_cast<std::size_t>(nt));
+}
+
+Conv2DNode::ScratchD& Conv2DNode::ensure_scratch_d(int tid) const {
+    const std::size_t idx = static_cast<std::size_t>(tid);
+    if (idx >= thread_scratch_d_.size()) {
+        #pragma omp critical(fastopt_conv2d_scratch)
+        { if (idx >= thread_scratch_d_.size()) thread_scratch_d_.resize(idx + 1); }
+    }
+    if (!thread_scratch_d_[idx]) thread_scratch_d_[idx] = std::make_shared<ScratchD>();
+    return *thread_scratch_d_[idx];
+}
+
+Conv2DNode::ScratchF& Conv2DNode::ensure_scratch_f(int tid) const {
+    const std::size_t idx = static_cast<std::size_t>(tid);
+    if (idx >= thread_scratch_f_.size()) {
+        #pragma omp critical(fastopt_conv2d_scratch)
+        { if (idx >= thread_scratch_f_.size()) thread_scratch_f_.resize(idx + 1); }
+    }
+    if (!thread_scratch_f_[idx]) thread_scratch_f_[idx] = std::make_shared<ScratchF>();
+    return *thread_scratch_f_[idx];
+}
+
+void Conv2DNode::forward(Workspace& ws) const {
+    const Node& in = graph->node(inputs[0]);
+    const int tid = omp_in_parallel() ? omp_get_thread_num() : 0;
+    Eigen::Map<const Eigen::MatrixXd> Xm(ws.val.data() + in.offset, data->c_in, static_cast<Eigen::Index>(h_in) * w_in);
+    Eigen::Map<Eigen::MatrixXd> Ym(ws.val.data() + offset, data->c_out, static_cast<Eigen::Index>(h_out) * w_out);
+    if (data->use_float32) {
+        auto& sc = ensure_scratch_f(tid);
+        conv2d_run_primal<float>(*data, h_in, w_in, h_out, w_out, Xm, Ym, sc);
+        sc.cached_x = ws.val.segment(in.offset, in.size()); sc.has_primal = true; sc.has_tangent = false;
+    } else {
+        auto& sc = ensure_scratch_d(tid);
+        conv2d_run_primal<double>(*data, h_in, w_in, h_out, w_out, Xm, Ym, sc);
+        sc.cached_x = ws.val.segment(in.offset, in.size()); sc.has_primal = true; sc.has_tangent = false;
+    }
+}
+
+void Conv2DNode::backward(Workspace& ws) const {
+    const Node& in = graph->node(inputs[0]);
+    if (!in.requires_grad || ws.bar.segment(offset, size()).squaredNorm() == 0.0) return;
+    const int tid = omp_in_parallel() ? omp_get_thread_num() : 0;
+    const auto x_seg = ws.val.segment(in.offset, in.size());
+    const Eigen::Index s_in = static_cast<Eigen::Index>(h_in) * w_in;
+    const Eigen::Index s_out = static_cast<Eigen::Index>(h_out) * w_out;
+    Eigen::Map<const Eigen::MatrixXd> Xm(ws.val.data() + in.offset, data->c_in, s_in);
+    Eigen::Map<const Eigen::MatrixXd> Yb(ws.bar.data() + offset, data->c_out, s_out);
+    Eigen::Map<Eigen::MatrixXd> Xb(ws.bar.data() + in.offset, data->c_in, s_in);
+    if (data->use_float32) {
+        auto& sc = ensure_scratch_f(tid);
+        const ScratchF* pr = &sc;
+        if (!(sc.has_primal && sc.cached_x == x_seg)) {
+            if (tid > 0 && thread_scratch_f_[0] && thread_scratch_f_[0]->has_primal && thread_scratch_f_[0]->cached_x == x_seg) pr = thread_scratch_f_[0].get();
+            else { Eigen::MatrixXd ty(data->c_out, s_out); Eigen::Map<Eigen::MatrixXd> tym(ty.data(), data->c_out, s_out); conv2d_run_primal<float>(*data, h_in, w_in, h_out, w_out, Xm, tym, sc); sc.cached_x = x_seg; sc.has_primal = true; }
+        }
+        conv2d_run_backward<float>(*data, h_in, w_in, h_out, w_out, *pr, Yb, Xb, sc);
+    } else {
+        auto& sc = ensure_scratch_d(tid);
+        const ScratchD* pr = &sc;
+        if (!(sc.has_primal && sc.cached_x == x_seg)) {
+            if (tid > 0 && thread_scratch_d_[0] && thread_scratch_d_[0]->has_primal && thread_scratch_d_[0]->cached_x == x_seg) pr = thread_scratch_d_[0].get();
+            else { Eigen::MatrixXd ty(data->c_out, s_out); Eigen::Map<Eigen::MatrixXd> tym(ty.data(), data->c_out, s_out); conv2d_run_primal<double>(*data, h_in, w_in, h_out, w_out, Xm, tym, sc); sc.cached_x = x_seg; sc.has_primal = true; }
+        }
+        conv2d_run_backward<double>(*data, h_in, w_in, h_out, w_out, *pr, Yb, Xb, sc);
+    }
+}
+
+void Conv2DNode::forward_tangent(Workspace& ws) const {
+    const Node& in = graph->node(inputs[0]);
+    if (!in.requires_grad) { ws.dot.segment(offset, size()).setZero(); return; }
+    const int tid = omp_in_parallel() ? omp_get_thread_num() : 0;
+    const auto x_seg = ws.val.segment(in.offset, in.size());
+    const auto xd_seg = ws.dot.segment(in.offset, in.size());
+    const Eigen::Index s_in = static_cast<Eigen::Index>(h_in) * w_in;
+    const Eigen::Index s_out = static_cast<Eigen::Index>(h_out) * w_out;
+    Eigen::Map<const Eigen::MatrixXd> Xm(ws.val.data() + in.offset, data->c_in, s_in);
+    Eigen::Map<const Eigen::MatrixXd> Xd(ws.dot.data() + in.offset, data->c_in, s_in);
+    Eigen::Map<Eigen::MatrixXd> Yd(ws.dot.data() + offset, data->c_out, s_out);
+    if (data->use_float32) {
+        auto& sc = ensure_scratch_f(tid);
+        const ScratchF* pr = &sc;
+        if (!(sc.has_primal && sc.cached_x == x_seg)) {
+            if (tid > 0 && thread_scratch_f_[0] && thread_scratch_f_[0]->has_primal && thread_scratch_f_[0]->cached_x == x_seg) pr = thread_scratch_f_[0].get();
+            else { Eigen::MatrixXd ty(data->c_out, s_out); Eigen::Map<Eigen::MatrixXd> tym(ty.data(), data->c_out, s_out); conv2d_run_primal<float>(*data, h_in, w_in, h_out, w_out, Xm, tym, sc); sc.cached_x = x_seg; sc.has_primal = true; }
+        }
+        conv2d_run_tangent<float>(*data, h_in, w_in, h_out, w_out, *pr, Xd, Yd, sc);
+        sc.cached_xdot = xd_seg; sc.has_tangent = true;
+    } else {
+        auto& sc = ensure_scratch_d(tid);
+        const ScratchD* pr = &sc;
+        if (!(sc.has_primal && sc.cached_x == x_seg)) {
+            if (tid > 0 && thread_scratch_d_[0] && thread_scratch_d_[0]->has_primal && thread_scratch_d_[0]->cached_x == x_seg) pr = thread_scratch_d_[0].get();
+            else { Eigen::MatrixXd ty(data->c_out, s_out); Eigen::Map<Eigen::MatrixXd> tym(ty.data(), data->c_out, s_out); conv2d_run_primal<double>(*data, h_in, w_in, h_out, w_out, Xm, tym, sc); sc.cached_x = x_seg; sc.has_primal = true; }
+        }
+        conv2d_run_tangent<double>(*data, h_in, w_in, h_out, w_out, *pr, Xd, Yd, sc);
+        sc.cached_xdot = xd_seg; sc.has_tangent = true;
+    }
+}
+
+void Conv2DNode::backward_hessian(Workspace& ws) const {
+    const Node& in = graph->node(inputs[0]);
+    if (!in.requires_grad) return;
+    if (ws.bar.segment(offset, size()).squaredNorm() == 0.0 && ws.dot_bar.segment(offset, size()).squaredNorm() == 0.0) return;
+    const int tid = omp_in_parallel() ? omp_get_thread_num() : 0;
+    const auto x_seg = ws.val.segment(in.offset, in.size());
+    const auto xd_seg = ws.dot.segment(in.offset, in.size());
+    const Eigen::Index s_in = static_cast<Eigen::Index>(h_in) * w_in;
+    const Eigen::Index s_out = static_cast<Eigen::Index>(h_out) * w_out;
+    Eigen::Map<const Eigen::MatrixXd> Xm(ws.val.data() + in.offset, data->c_in, s_in);
+    Eigen::Map<const Eigen::MatrixXd> Xd(ws.dot.data() + in.offset, data->c_in, s_in);
+    Eigen::Map<const Eigen::MatrixXd> Yb(ws.bar.data() + offset, data->c_out, s_out);
+    Eigen::Map<const Eigen::MatrixXd> Ydb(ws.dot_bar.data() + offset, data->c_out, s_out);
+    Eigen::Map<Eigen::MatrixXd> Xdb(ws.dot_bar.data() + in.offset, data->c_in, s_in);
+    if (data->use_float32) {
+        auto& sc = ensure_scratch_f(tid);
+        const ScratchF* pr = &sc;
+        if (!(sc.has_primal && sc.cached_x == x_seg)) {
+            if (tid > 0 && thread_scratch_f_[0] && thread_scratch_f_[0]->has_primal && thread_scratch_f_[0]->cached_x == x_seg) pr = thread_scratch_f_[0].get();
+            else { Eigen::MatrixXd ty(data->c_out, s_out); Eigen::Map<Eigen::MatrixXd> tym(ty.data(), data->c_out, s_out); conv2d_run_primal<float>(*data, h_in, w_in, h_out, w_out, Xm, tym, sc); sc.cached_x = x_seg; sc.has_primal = true; }
+        }
+        if (!(sc.has_tangent && sc.cached_xdot == xd_seg)) {
+            Eigen::MatrixXd tyd(data->c_out, s_out); Eigen::Map<Eigen::MatrixXd> tydm(tyd.data(), data->c_out, s_out);
+            conv2d_run_tangent<float>(*data, h_in, w_in, h_out, w_out, *pr, Xd, tydm, sc); sc.cached_xdot = xd_seg; sc.has_tangent = true;
+        }
+        conv2d_run_hessian<float>(*data, h_in, w_in, h_out, w_out, *pr, sc, Yb, Ydb, Xdb, sc);
+    } else {
+        auto& sc = ensure_scratch_d(tid);
+        const ScratchD* pr = &sc;
+        if (!(sc.has_primal && sc.cached_x == x_seg)) {
+            if (tid > 0 && thread_scratch_d_[0] && thread_scratch_d_[0]->has_primal && thread_scratch_d_[0]->cached_x == x_seg) pr = thread_scratch_d_[0].get();
+            else { Eigen::MatrixXd ty(data->c_out, s_out); Eigen::Map<Eigen::MatrixXd> tym(ty.data(), data->c_out, s_out); conv2d_run_primal<double>(*data, h_in, w_in, h_out, w_out, Xm, tym, sc); sc.cached_x = x_seg; sc.has_primal = true; }
+        }
+        if (!(sc.has_tangent && sc.cached_xdot == xd_seg)) {
+            Eigen::MatrixXd tyd(data->c_out, s_out); Eigen::Map<Eigen::MatrixXd> tydm(tyd.data(), data->c_out, s_out);
+            conv2d_run_tangent<double>(*data, h_in, w_in, h_out, w_out, *pr, Xd, tydm, sc); sc.cached_xdot = xd_seg; sc.has_tangent = true;
+        }
+        conv2d_run_hessian<double>(*data, h_in, w_in, h_out, w_out, *pr, sc, Yb, Ydb, Xdb, sc);
+    }
+}
+
+// Pool2DNode implementation
+Pool2DNode::Pool2DNode(Shape out_shape, int x_id, Pool2DMode mode_,
+                       Eigen::Index channels_, int h_in_, int w_in_, int h_out_, int w_out_,
+                       int kh_, int kw_, int sh_, int sw_, int ph_, int pw_, std::string name_)
+    : Node(OpType::Pool2D, out_shape, {x_id}, std::move(name_)),
+      mode(mode_), channels(channels_), h_in(h_in_), w_in(w_in_), h_out(h_out_), w_out(w_out_),
+      kh(kh_), kw(kw_), sh(sh_), sw(sw_), ph(ph_), pw(pw_) {
+    thread_argmax_.resize(static_cast<std::size_t>(std::max(1, omp_get_max_threads())));
+}
+
+std::vector<Eigen::Index>& Pool2DNode::ensure_argmax(int tid) const {
+    const std::size_t idx = static_cast<std::size_t>(tid);
+    if (idx >= thread_argmax_.size()) {
+        #pragma omp critical(fastopt_pool2d_scratch)
+        { if (idx >= thread_argmax_.size()) thread_argmax_.resize(idx + 1); }
+    }
+    return thread_argmax_[idx];
+}
+
+void Pool2DNode::forward(Workspace& ws) const {
+    const Node& in = graph->node(inputs[0]);
+    const int tid = omp_in_parallel() ? omp_get_thread_num() : 0;
+    const double* xp = ws.val.data() + in.offset;
+    double* yp = ws.val.data() + offset;
+    auto& am = ensure_argmax(tid);
+    if (mode == Pool2DMode::Max) am.resize(static_cast<std::size_t>(size()));
+
+    for (int ho = 0; ho < h_out; ++ho) {
+        for (int wo = 0; wo < w_out; ++wo) {
+            const Eigen::Index out_col = static_cast<Eigen::Index>(ho) * w_out + wo;
+            for (Eigen::Index ch = 0; ch < channels; ++ch) {
+                const Eigen::Index out_idx = out_col * channels + ch;
+                if (mode == Pool2DMode::Avg) {
+                    double acc = 0.0;
+                    int cnt = 0;
+                    for (int r = 0; r < kh; ++r) {
+                        const int hi = ho * sh - ph + r;
+                        if (hi < 0 || hi >= h_in) continue;
+                        for (int c = 0; c < kw; ++c) {
+                            const int wi = wo * sw - pw + c;
+                            if (wi < 0 || wi >= w_in) continue;
+                            acc += xp[(static_cast<Eigen::Index>(hi) * w_in + wi) * channels + ch];
+                            ++cnt;
+                        }
+                    }
+                    yp[out_idx] = (cnt > 0) ? (acc / static_cast<double>(cnt)) : 0.0;
+                } else {
+                    double best = -std::numeric_limits<double>::infinity();
+                    Eigen::Index best_idx = -1;
+                    for (int r = 0; r < kh; ++r) {
+                        const int hi = ho * sh - ph + r;
+                        if (hi < 0 || hi >= h_in) continue;
+                        for (int c = 0; c < kw; ++c) {
+                            const int wi = wo * sw - pw + c;
+                            if (wi < 0 || wi >= w_in) continue;
+                            const Eigen::Index in_idx = (static_cast<Eigen::Index>(hi) * w_in + wi) * channels + ch;
+                            if (best_idx < 0 || xp[in_idx] > best) { best = xp[in_idx]; best_idx = in_idx; }
+                        }
+                    }
+                    yp[out_idx] = (best_idx >= 0) ? best : 0.0;
+                    am[static_cast<std::size_t>(out_idx)] = best_idx;
+                }
+            }
+        }
+    }
+}
+
+void Pool2DNode::backward(Workspace& ws) const {
+    const Node& in = graph->node(inputs[0]);
+    if (!in.requires_grad) return;
+    const double* xp = ws.val.data() + in.offset;
+    const double* yb = ws.bar.data() + offset;
+    double* xb = ws.bar.data() + in.offset;
+    for (int ho = 0; ho < h_out; ++ho) {
+        for (int wo = 0; wo < w_out; ++wo) {
+            const Eigen::Index out_col = static_cast<Eigen::Index>(ho) * w_out + wo;
+            for (Eigen::Index ch = 0; ch < channels; ++ch) {
+                const Eigen::Index out_idx = out_col * channels + ch;
+                const double g = yb[out_idx];
+                if (g == 0.0) continue;
+                if (mode == Pool2DMode::Avg) {
+                    int cnt = 0;
+                    for (int r = 0; r < kh; ++r) {
+                        const int hi = ho * sh - ph + r;
+                        if (hi < 0 || hi >= h_in) continue;
+                        for (int c = 0; c < kw; ++c) {
+                            const int wi = wo * sw - pw + c;
+                            if (wi >= 0 && wi < w_in) ++cnt;
+                        }
+                    }
+                    if (cnt == 0) continue;
+                    const double gv = g / static_cast<double>(cnt);
+                    for (int r = 0; r < kh; ++r) {
+                        const int hi = ho * sh - ph + r;
+                        if (hi < 0 || hi >= h_in) continue;
+                        for (int c = 0; c < kw; ++c) {
+                            const int wi = wo * sw - pw + c;
+                            if (wi >= 0 && wi < w_in)
+                                xb[(static_cast<Eigen::Index>(hi) * w_in + wi) * channels + ch] += gv;
+                        }
+                    }
+                } else {
+                    double best = -std::numeric_limits<double>::infinity();
+                    Eigen::Index best_idx = -1;
+                    for (int r = 0; r < kh; ++r) {
+                        const int hi = ho * sh - ph + r;
+                        if (hi < 0 || hi >= h_in) continue;
+                        for (int c = 0; c < kw; ++c) {
+                            const int wi = wo * sw - pw + c;
+                            if (wi < 0 || wi >= w_in) continue;
+                            const Eigen::Index in_idx = (static_cast<Eigen::Index>(hi) * w_in + wi) * channels + ch;
+                            if (best_idx < 0 || xp[in_idx] > best) { best = xp[in_idx]; best_idx = in_idx; }
+                        }
+                    }
+                    if (best_idx >= 0) xb[best_idx] += g;
+                }
+            }
+        }
+    }
+}
+
+void Pool2DNode::forward_tangent(Workspace& ws) const {
+    const Node& in = graph->node(inputs[0]);
+    if (!in.requires_grad) { ws.dot.segment(offset, size()).setZero(); return; }
+    const double* xp = ws.val.data() + in.offset;
+    const double* xd = ws.dot.data() + in.offset;
+    double* yd = ws.dot.data() + offset;
+    for (int ho = 0; ho < h_out; ++ho) {
+        for (int wo = 0; wo < w_out; ++wo) {
+            const Eigen::Index out_col = static_cast<Eigen::Index>(ho) * w_out + wo;
+            for (Eigen::Index ch = 0; ch < channels; ++ch) {
+                const Eigen::Index out_idx = out_col * channels + ch;
+                if (mode == Pool2DMode::Avg) {
+                    double acc = 0.0;
+                    int cnt = 0;
+                    for (int r = 0; r < kh; ++r) {
+                        const int hi = ho * sh - ph + r;
+                        if (hi < 0 || hi >= h_in) continue;
+                        for (int c = 0; c < kw; ++c) {
+                            const int wi = wo * sw - pw + c;
+                            if (wi >= 0 && wi < w_in) {
+                                acc += xd[(static_cast<Eigen::Index>(hi) * w_in + wi) * channels + ch];
+                                ++cnt;
+                            }
+                        }
+                    }
+                    yd[out_idx] = (cnt > 0) ? (acc / static_cast<double>(cnt)) : 0.0;
+                } else {
+                    double best = -std::numeric_limits<double>::infinity();
+                    Eigen::Index best_idx = -1;
+                    for (int r = 0; r < kh; ++r) {
+                        const int hi = ho * sh - ph + r;
+                        if (hi < 0 || hi >= h_in) continue;
+                        for (int c = 0; c < kw; ++c) {
+                            const int wi = wo * sw - pw + c;
+                            if (wi < 0 || wi >= w_in) continue;
+                            const Eigen::Index in_idx = (static_cast<Eigen::Index>(hi) * w_in + wi) * channels + ch;
+                            if (best_idx < 0 || xp[in_idx] > best) { best = xp[in_idx]; best_idx = in_idx; }
+                        }
+                    }
+                    yd[out_idx] = (best_idx >= 0) ? xd[best_idx] : 0.0;
+                }
+            }
+        }
+    }
+}
+
+void Pool2DNode::backward_hessian(Workspace& ws) const {
+    // Pool2D (Avg & piecewise-linear Max) has zero 2nd-order local curvature; propagate dot_bar identically to bar.
+    const Node& in = graph->node(inputs[0]);
+    if (!in.requires_grad) return;
+    const double* xp = ws.val.data() + in.offset;
+    const double* ydb = ws.dot_bar.data() + offset;
+    double* xdb = ws.dot_bar.data() + in.offset;
+    for (int ho = 0; ho < h_out; ++ho) {
+        for (int wo = 0; wo < w_out; ++wo) {
+            const Eigen::Index out_col = static_cast<Eigen::Index>(ho) * w_out + wo;
+            for (Eigen::Index ch = 0; ch < channels; ++ch) {
+                const Eigen::Index out_idx = out_col * channels + ch;
+                const double g = ydb[out_idx];
+                if (g == 0.0) continue;
+                if (mode == Pool2DMode::Avg) {
+                    int cnt = 0;
+                    for (int r = 0; r < kh; ++r) {
+                        const int hi = ho * sh - ph + r;
+                        if (hi < 0 || hi >= h_in) continue;
+                        for (int c = 0; c < kw; ++c) {
+                            const int wi = wo * sw - pw + c;
+                            if (wi >= 0 && wi < w_in) ++cnt;
+                        }
+                    }
+                    if (cnt == 0) continue;
+                    const double gv = g / static_cast<double>(cnt);
+                    for (int r = 0; r < kh; ++r) {
+                        const int hi = ho * sh - ph + r;
+                        if (hi < 0 || hi >= h_in) continue;
+                        for (int c = 0; c < kw; ++c) {
+                            const int wi = wo * sw - pw + c;
+                            if (wi >= 0 && wi < w_in)
+                                xdb[(static_cast<Eigen::Index>(hi) * w_in + wi) * channels + ch] += gv;
+                        }
+                    }
+                } else {
+                    double best = -std::numeric_limits<double>::infinity();
+                    Eigen::Index best_idx = -1;
+                    for (int r = 0; r < kh; ++r) {
+                        const int hi = ho * sh - ph + r;
+                        if (hi < 0 || hi >= h_in) continue;
+                        for (int c = 0; c < kw; ++c) {
+                            const int wi = wo * sw - pw + c;
+                            if (wi < 0 || wi >= w_in) continue;
+                            const Eigen::Index in_idx = (static_cast<Eigen::Index>(hi) * w_in + wi) * channels + ch;
+                            if (best_idx < 0 || xp[in_idx] > best) { best = xp[in_idx]; best_idx = in_idx; }
+                        }
+                    }
+                    if (best_idx >= 0) xdb[best_idx] += g;
+                }
+            }
+        }
+    }
+}
+
+// RMSNormNode implementation (exact 0th, 1st, and 2nd-order Forward-over-Reverse HVP)
+RMSNormNode::RMSNormNode(Shape out_shape, int x_id, Eigen::VectorXd gamma_, double eps_, std::string name_)
+    : Node(OpType::RMSNorm, out_shape, {x_id}, std::move(name_)),
+      gamma(std::move(gamma_)), eps(eps_), dim(out_shape.rows), cols(out_shape.cols) {}
+
+void RMSNormNode::forward(Workspace& ws) const {
+    const Node& in = graph->node(inputs[0]);
+    const double inv_D = 1.0 / static_cast<double>(dim);
+    const bool has_g = (gamma.size() == dim);
+    for (Eigen::Index b = 0; b < cols; ++b) {
+        const double* x = ws.val.data() + in.offset + b * dim;
+        double* y = ws.val.data() + offset + b * dim;
+        double ms = 0.0;
+        for (Eigen::Index i = 0; i < dim; ++i) ms += x[i] * x[i];
+        const double s = 1.0 / std::sqrt(ms * inv_D + eps);
+        for (Eigen::Index i = 0; i < dim; ++i) {
+            y[i] = (has_g ? gamma[i] : 1.0) * (x[i] * s);
+        }
+    }
+}
+
+void RMSNormNode::backward(Workspace& ws) const {
+    const Node& in = graph->node(inputs[0]);
+    if (!in.requires_grad) return;
+    const double inv_D = 1.0 / static_cast<double>(dim);
+    const bool has_g = (gamma.size() == dim);
+    for (Eigen::Index b = 0; b < cols; ++b) {
+        const double* x = ws.val.data() + in.offset + b * dim;
+        const double* yb = ws.bar.data() + offset + b * dim;
+        double* xb = ws.bar.data() + in.offset + b * dim;
+        double ms = 0.0;
+        for (Eigen::Index i = 0; i < dim; ++i) ms += x[i] * x[i];
+        const double s = 1.0 / std::sqrt(ms * inv_D + eps);
+        double m = 0.0;
+        for (Eigen::Index i = 0; i < dim; ++i) {
+            const double g = (has_g ? gamma[i] : 1.0) * yb[i];
+            m += g * (x[i] * s);
+        }
+        m *= inv_D;
+        for (Eigen::Index i = 0; i < dim; ++i) {
+            const double g = (has_g ? gamma[i] : 1.0) * yb[i];
+            xb[i] += s * (g - (x[i] * s) * m);
+        }
+    }
+}
+
+void RMSNormNode::forward_tangent(Workspace& ws) const {
+    const Node& in = graph->node(inputs[0]);
+    if (!in.requires_grad) { ws.dot.segment(offset, size()).setZero(); return; }
+    const double inv_D = 1.0 / static_cast<double>(dim);
+    const bool has_g = (gamma.size() == dim);
+    for (Eigen::Index b = 0; b < cols; ++b) {
+        const double* x = ws.val.data() + in.offset + b * dim;
+        const double* xd = ws.dot.data() + in.offset + b * dim;
+        double* yd = ws.dot.data() + offset + b * dim;
+        double ms = 0.0;
+        for (Eigen::Index i = 0; i < dim; ++i) ms += x[i] * x[i];
+        const double s = 1.0 / std::sqrt(ms * inv_D + eps);
+        double p = 0.0;
+        for (Eigen::Index i = 0; i < dim; ++i) p += (x[i] * s) * xd[i];
+        p *= inv_D;
+        for (Eigen::Index i = 0; i < dim; ++i) {
+            const double dxhat = s * (xd[i] - (x[i] * s) * p);
+            yd[i] = (has_g ? gamma[i] : 1.0) * dxhat;
+        }
+    }
+}
+
+void RMSNormNode::backward_hessian(Workspace& ws) const {
+    const Node& in = graph->node(inputs[0]);
+    if (!in.requires_grad) return;
+    const double inv_D = 1.0 / static_cast<double>(dim);
+    const bool has_g = (gamma.size() == dim);
+    for (Eigen::Index b = 0; b < cols; ++b) {
+        const double* x = ws.val.data() + in.offset + b * dim;
+        const double* xd = ws.dot.data() + in.offset + b * dim;
+        const double* yb = ws.bar.data() + offset + b * dim;
+        const double* ydb = ws.dot_bar.data() + offset + b * dim;
+        double* xdb = ws.dot_bar.data() + in.offset + b * dim;
+        double ms = 0.0;
+        for (Eigen::Index i = 0; i < dim; ++i) ms += x[i] * x[i];
+        const double s = 1.0 / std::sqrt(ms * inv_D + eps);
+        double p = 0.0;
+        for (Eigen::Index i = 0; i < dim; ++i) p += (x[i] * s) * xd[i];
+        p *= inv_D;
+        double m = 0.0, dm = 0.0;
+        for (Eigen::Index i = 0; i < dim; ++i) {
+            const double gam = has_g ? gamma[i] : 1.0;
+            const double g = gam * yb[i];
+            const double dg = gam * ydb[i];
+            const double xh = x[i] * s;
+            const double dxh = s * (xd[i] - xh * p);
+            m += g * xh;
+            dm += dg * xh + g * dxh;
+        }
+        m *= inv_D;
+        dm *= inv_D;
+        for (Eigen::Index i = 0; i < dim; ++i) {
+            const double gam = has_g ? gamma[i] : 1.0;
+            const double g = gam * yb[i];
+            const double dg = gam * ydb[i];
+            const double xh = x[i] * s;
+            const double dxh = s * (xd[i] - xh * p);
+            const double xb_i = s * (g - xh * m);
+            xdb[i] += -s * p * xb_i + s * (dg - dxh * m - xh * dm);
+        }
+    }
+}
+
+
+// ============================================================================
+// Phase 19: Native C++17 Kernel Surrogate Engine (RBF, Kriging, GEK, KPLS, CoKriging)
+// ============================================================================
+namespace {
+
+inline void surrogate_kernel_jet3(SurrogateKernel kern, double q, double r_eps,
+                                  double& p0, double& p1, double& p2, double& p3) {
+    switch (kern) {
+        case SurrogateKernel::Gaussian: {
+            const double e = std::exp(-q);
+            p0 = e; p1 = -e; p2 = e; p3 = -e;
+            return;
+        }
+        case SurrogateKernel::Multiquadric: {
+            const double qp1 = q + 1.0;
+            const double sq = std::sqrt(qp1);
+            const double inv1 = 1.0 / sq;
+            const double inv3 = inv1 / qp1;
+            const double inv5 = inv3 / qp1;
+            p0 = sq;
+            p1 = 0.5 * inv1;
+            p2 = -0.25 * inv3;
+            p3 = 0.375 * inv5;
+            return;
+        }
+        case SurrogateKernel::InvMultiquadric: {
+            const double qp1 = q + 1.0;
+            const double sq = std::sqrt(qp1);
+            const double inv1 = 1.0 / sq;
+            const double inv3 = inv1 / qp1;
+            const double inv5 = inv3 / qp1;
+            const double inv7 = inv5 / qp1;
+            p0 = inv1;
+            p1 = -0.5 * inv3;
+            p2 = 0.75 * inv5;
+            p3 = -1.875 * inv7;
+            return;
+        }
+        case SurrogateKernel::Cubic: {
+            const double qs = q + r_eps;
+            const double r = std::sqrt(qs);
+            const double inv_r = 1.0 / r;
+            p0 = qs * r;
+            p1 = 1.5 * r;
+            p2 = 0.75 * inv_r;
+            p3 = -0.375 * inv_r / qs;
+            return;
+        }
+        case SurrogateKernel::ThinPlateSpline: {
+            const double qs = q + r_eps;
+            const double inv1 = 1.0 / qs;
+            const double inv2 = inv1 * inv1;
+            const double inv3 = inv2 * inv1;
+            const double lq = std::log(qs);
+            p0 = 0.5 * q * lq;
+            p1 = 0.5 * (lq + q * inv1);
+            p2 = 0.5 * (q + 2.0 * r_eps) * inv2;
+            p3 = -0.5 * (q + 3.0 * r_eps) * inv3;
+            return;
+        }
+        case SurrogateKernel::Matern32: {
+            const double s2 = 3.0 * q + r_eps;
+            const double s = std::sqrt(s2);
+            const double e = std::exp(-s);
+            p0 = (1.0 + s) * e;
+            p1 = -1.5 * e;
+            p2 = 2.25 * e / s;
+            p3 = -3.375 * e * (s + 1.0) / (s2 * s);
+            return;
+        }
+        case SurrogateKernel::Matern52: {
+            const double s2 = 5.0 * q + r_eps;
+            const double s = std::sqrt(s2);
+            const double e = std::exp(-s);
+            p0 = (1.0 + s + (1.0 / 3.0) * s2) * e;
+            p1 = -(5.0 / 6.0) * (1.0 + s) * e;
+            p2 = (25.0 / 12.0) * e;
+            p3 = -(125.0 / 24.0) * e / s;
+            return;
+        }
+    }
+    p0 = 1.0; p1 = 0.0; p2 = 0.0; p3 = 0.0;
+}
+
+inline void eval_poly_basis(const Eigen::VectorXd& x, int deg, Eigen::VectorXd& p) {
+    const Eigen::Index d = x.size();
+    const Eigen::Index np = SurrogateEngineData::poly_dim(d, deg);
+    p.resize(np);
+    if (deg < 0) return;
+    Eigen::Index idx = 0;
+    p(idx++) = 1.0;
+    if (deg >= 1) {
+        for (Eigen::Index j = 0; j < d; ++j) p(idx++) = x(j);
+    }
+    if (deg >= 2) {
+        for (Eigen::Index a = 0; a < d; ++a) {
+            const double xa = x(a);
+            for (Eigen::Index b = a; b < d; ++b) {
+                p(idx++) = xa * x(b);
+            }
+        }
+    }
+}
+
+inline void eval_poly_tangent(const Eigen::VectorXd& x, const Eigen::VectorXd& v, int deg, Eigen::VectorXd& dp) {
+    const Eigen::Index d = x.size();
+    const Eigen::Index np = SurrogateEngineData::poly_dim(d, deg);
+    dp.resize(np);
+    if (deg < 0) return;
+    Eigen::Index idx = 0;
+    dp(idx++) = 0.0;
+    if (deg >= 1) {
+        for (Eigen::Index j = 0; j < d; ++j) dp(idx++) = v(j);
+    }
+    if (deg >= 2) {
+        for (Eigen::Index a = 0; a < d; ++a) {
+            for (Eigen::Index b = a; b < d; ++b) {
+                dp(idx++) = (a == b) ? (2.0 * x(a) * v(a)) : (x(a) * v(b) + x(b) * v(a));
+            }
+        }
+    }
+}
+
+inline void accum_poly_grad(const Eigen::VectorXd& x, const Eigen::VectorXd& w, int deg, Eigen::VectorXd& gx) {
+    if (deg < 1 || w.size() == 0) return;
+    const Eigen::Index d = x.size();
+    Eigen::Index idx = 1;
+    for (Eigen::Index j = 0; j < d; ++j) gx(j) += w(idx++);
+    if (deg >= 2) {
+        for (Eigen::Index a = 0; a < d; ++a) {
+            for (Eigen::Index b = a; b < d; ++b) {
+                const double cw = w(idx++);
+                if (a == b) {
+                    gx(a) += 2.0 * cw * x(a);
+                } else {
+                    gx(a) += cw * x(b);
+                    gx(b) += cw * x(a);
+                }
+            }
+        }
+    }
+}
+
+inline void accum_poly_hvp(const Eigen::VectorXd& v, const Eigen::VectorXd& w, int deg, Eigen::VectorXd& hv) {
+    if (deg < 2 || w.size() == 0) return;
+    const Eigen::Index d = v.size();
+    Eigen::Index idx = 1 + d;
+    for (Eigen::Index a = 0; a < d; ++a) {
+        for (Eigen::Index b = a; b < d; ++b) {
+            const double cw = w(idx++);
+            if (a == b) {
+                hv(a) += 2.0 * cw * v(a);
+            } else {
+                hv(a) += cw * v(b);
+                hv(b) += cw * v(a);
+            }
+        }
+    }
+}
+
+inline void accum_kernel_lincomb_grad_and_hvp(
+    const SurrogateEngineData& D,
+    const Eigen::VectorXd& xt,
+    const Eigen::VectorXd* vt,
+    const Eigen::VectorXd& w_val,
+    const Eigen::VectorXd* w_grad,
+    bool w_grad_prescaled,
+    Eigen::VectorXd* gx_out,
+    Eigen::VectorXd* hv_out,
+    double scale = 1.0) {
+    const Eigen::Index d = D.d_in;
+    const Eigen::Index N = D.n_centers;
+    Eigen::VectorXd u(d), tu(d), tv;
+    if (vt) tv = D.theta.cwiseProduct(*vt);
+
+    for (Eigen::Index i = 0; i < N; ++i) {
+        u = xt - D.X_centers.col(i);
+        tu = D.theta.cwiseProduct(u);
+        const double q = u.dot(tu);
+        double p0, p1, p2, p3;
+        surrogate_kernel_jet3(D.kernel, q, D.r_eps, p0, p1, p2, p3);
+
+        const double a_i = w_val(i);
+        double s_i = 0.0;
+        double ds_i = 0.0;
+        const bool use_g = (w_grad != nullptr && w_grad->size() == N * d);
+        if (use_g) {
+            const auto gi = w_grad->segment(i * d, d);
+            if (w_grad_prescaled) {
+                s_i = gi.dot(u);
+                if (vt) ds_i = gi.dot(*vt);
+            } else {
+                s_i = gi.dot(tu);
+                if (vt) ds_i = gi.dot(tv);
+            }
+        }
+
+        const double c1 = 2.0 * a_i * p1 - 4.0 * p2 * s_i;
+        if (gx_out) {
+            gx_out->noalias() += (scale * c1) * tu;
+            if (use_g) {
+                const auto gi = w_grad->segment(i * d, d);
+                if (w_grad_prescaled) {
+                    gx_out->noalias() -= (scale * 2.0 * p1) * gi;
+                } else {
+                    gx_out->noalias() -= (scale * 2.0 * p1) * D.theta.cwiseProduct(gi);
+                }
+            }
+        }
+        if (hv_out && vt) {
+            const double dq = 2.0 * tu.dot(*vt);
+            const double dc1 = (2.0 * a_i * p2 - 4.0 * p3 * s_i) * dq - 4.0 * p2 * ds_i;
+            hv_out->noalias() += (scale * dc1) * tu + (scale * c1) * tv;
+            if (use_g) {
+                const auto gi = w_grad->segment(i * d, d);
+                if (w_grad_prescaled) {
+                    hv_out->noalias() -= (scale * 2.0 * p2 * dq) * gi;
+                } else {
+                    hv_out->noalias() -= (scale * 2.0 * p2 * dq) * D.theta.cwiseProduct(gi);
+                }
+            }
+        }
+    }
+}
+
+inline void eval_kernel_basis_and_tangent(
+    const SurrogateEngineData& D,
+    const Eigen::VectorXd& xt,
+    const Eigen::VectorXd* vt,
+    Eigen::VectorXd& k_out,
+    Eigen::VectorXd* dk_out) {
+    const Eigen::Index d = D.d_in;
+    const Eigen::Index N = D.n_centers;
+    const Eigen::Index M = D.has_grad_basis ? N * (1 + d) : N;
+    k_out.resize(M);
+    if (dk_out) dk_out->resize(M);
+
+    Eigen::VectorXd u(d), tu(d), tv;
+    if (vt) tv = D.theta.cwiseProduct(*vt);
+
+    for (Eigen::Index i = 0; i < N; ++i) {
+        u = xt - D.X_centers.col(i);
+        tu = D.theta.cwiseProduct(u);
+        const double q = u.dot(tu);
+        double p0, p1, p2, p3;
+        surrogate_kernel_jet3(D.kernel, q, D.r_eps, p0, p1, p2, p3);
+
+        k_out(i) = p0;
+        double dq = 0.0;
+        if (vt && dk_out) {
+            dq = 2.0 * tu.dot(*vt);
+            (*dk_out)(i) = p1 * dq;
+        }
+        if (D.has_grad_basis) {
+            const Eigen::Index base = N + i * d;
+            k_out.segment(base, d) = (-2.0 * p1) * tu;
+            if (vt && dk_out) {
+                dk_out->segment(base, d) = (-2.0 * p2 * dq) * tu - (2.0 * p1) * tv;
+            }
+        }
+    }
+}
+
+
+// Numerically rock-solid Cholesky evaluation of Universal Kriging / GEK variance:
+// D.M_kk stores lower-triangular L_R (R = L_R L_R^T)
+// D.M_kp stores W_F = L_R^{-1} F (shape M x n_poly)
+// D.M_pp stores lower-triangular L_A (W_F^T W_F = L_A L_A^T)
+// V(x) = 1 - ||z1||^2 + ||z2||^2, where z1 = L_R^{-1} k, u = W_F^T z1 - p, z2 = L_A^{-1} u.
+inline void eval_cholesky_variance_state(
+    const SurrogateEngineData& D,
+    const Eigen::VectorXd& k_vec,
+    const Eigen::VectorXd& p_vec,
+    double& v_raw,
+    Eigen::VectorXd* qk_out,
+    Eigen::VectorXd* qp_out) {
+    Eigen::VectorXd z1 = D.M_kk.triangularView<Eigen::Lower>().solve(k_vec);
+    double v = 1.0 - z1.squaredNorm();
+    Eigen::VectorXd a_vec;
+    if (D.n_poly > 0) {
+        Eigen::VectorXd u = D.M_kp.transpose() * z1 - p_vec;
+        Eigen::VectorXd z2 = D.M_pp.triangularView<Eigen::Lower>().solve(u);
+        v += z2.squaredNorm();
+        if (qk_out || qp_out) {
+            a_vec = D.M_pp.triangularView<Eigen::Lower>().transpose().solve(z2);
+        }
+    }
+    v_raw = v;
+    if (qk_out) {
+        Eigen::VectorXd rhs = z1;
+        if (D.n_poly > 0) rhs.noalias() -= D.M_kp * a_vec;
+        *qk_out = D.M_kk.triangularView<Eigen::Lower>().transpose().solve(rhs);
+    }
+    if (qp_out && D.n_poly > 0) {
+        *qp_out = a_vec;
+    }
+}
+
+inline void eval_cholesky_variance_tangent(
+    const SurrogateEngineData& D,
+    const Eigen::VectorXd& dk_vec,
+    const Eigen::VectorXd& dp_vec,
+    Eigen::VectorXd& dqk_out,
+    Eigen::VectorXd& dqp_out) {
+    Eigen::VectorXd dz1 = D.M_kk.triangularView<Eigen::Lower>().solve(dk_vec);
+    Eigen::VectorXd da_vec;
+    if (D.n_poly > 0) {
+        Eigen::VectorXd du = D.M_kp.transpose() * dz1 - dp_vec;
+        Eigen::VectorXd dz2 = D.M_pp.triangularView<Eigen::Lower>().solve(du);
+        da_vec = D.M_pp.triangularView<Eigen::Lower>().transpose().solve(dz2);
+        dqp_out = da_vec;
+    }
+    Eigen::VectorXd rhs = dz1;
+    if (D.n_poly > 0) rhs.noalias() -= D.M_kp * da_vec;
+    dqk_out = D.M_kk.triangularView<Eigen::Lower>().transpose().solve(rhs);
+}
+
+} // anonymous namespace
+
+std::shared_ptr<const SurrogateEngineData> SurrogateEngineData::create(
+    SurrogateKernel kernel,
+    int poly_degree,
+    const Eigen::MatrixXd& X_centers,
+    const Eigen::VectorXd& theta,
+    const Eigen::MatrixXd& alpha,
+    const Eigen::MatrixXd& beta_grad,
+    const Eigen::MatrixXd& poly_coef,
+    const Eigen::VectorXd& in_mean,
+    const Eigen::VectorXd& in_inv_std,
+    const Eigen::VectorXd& out_mean,
+    const Eigen::VectorXd& out_std,
+    const Eigen::VectorXd& sigma2,
+    const Eigen::MatrixXd& M_kk,
+    const Eigen::MatrixXd& M_kp,
+    const Eigen::MatrixXd& M_pp,
+    double r_eps) {
+    if (X_centers.rows() <= 0 || X_centers.cols() <= 0) {
+        throw std::invalid_argument("Surrogate: X_centers must be non-empty (d_in, n_centers).");
+    }
+    const Eigen::Index d_in = X_centers.rows();
+    const Eigen::Index N = X_centers.cols();
+    if (theta.size() != d_in) {
+        throw std::invalid_argument("Surrogate: theta length must equal d_in.");
+    }
+    if (alpha.rows() != N || alpha.cols() <= 0) {
+        throw std::invalid_argument("Surrogate: alpha must have shape (n_centers, d_out).");
+    }
+    const Eigen::Index d_out = alpha.cols();
+    if (poly_degree < -1 || poly_degree > 2) {
+        throw std::invalid_argument("Surrogate: poly_degree must be -1, 0, 1, or 2.");
+    }
+    const Eigen::Index np = poly_dim(d_in, poly_degree);
+
+    auto data = std::make_shared<SurrogateEngineData>();
+    data->kernel = kernel;
+    data->poly_degree = poly_degree;
+    data->d_in = d_in;
+    data->d_out = d_out;
+    data->n_centers = N;
+    data->n_poly = np;
+    data->r_eps = r_eps;
+    data->X_centers = X_centers;
+    data->theta = theta;
+    data->alpha = alpha;
+
+    data->in_mean = (in_mean.size() == d_in) ? in_mean : Eigen::VectorXd::Zero(d_in);
+    data->in_inv_std = (in_inv_std.size() == d_in) ? in_inv_std : Eigen::VectorXd::Ones(d_in);
+    data->out_mean = (out_mean.size() == d_out) ? out_mean : Eigen::VectorXd::Zero(d_out);
+    data->out_std = (out_std.size() == d_out) ? out_std : Eigen::VectorXd::Ones(d_out);
+
+    if (beta_grad.size() > 0) {
+        if (beta_grad.rows() != N * d_in || beta_grad.cols() != d_out) {
+            throw std::invalid_argument("Surrogate: beta_grad must have shape (n_centers * d_in, d_out).");
+        }
+        data->has_grad_basis = true;
+        data->beta_scaled.resize(N * d_in, d_out);
+        for (Eigen::Index i = 0; i < N; ++i) {
+            data->beta_scaled.middleRows(i * d_in, d_in) =
+                beta_grad.middleRows(i * d_in, d_in).array().colwise() * theta.array();
+        }
+    }
+
+    if (np > 0) {
+        if (poly_coef.size() == 0) {
+            data->poly_coef = Eigen::MatrixXd::Zero(np, d_out);
+        } else {
+            if (poly_coef.rows() != np || poly_coef.cols() != d_out) {
+                throw std::invalid_argument("Surrogate: poly_coef shape mismatch.");
+            }
+            data->poly_coef = poly_coef;
+        }
+    }
+
+    if (sigma2.size() > 0 && M_kk.size() > 0) {
+        const Eigen::Index M = data->has_grad_basis ? N * (1 + d_in) : N;
+        if (sigma2.size() != d_out || M_kk.rows() != M || M_kk.cols() != M) {
+            throw std::invalid_argument("Surrogate: sigma2 or M_kk shape mismatch.");
+        }
+        data->has_variance = true;
+        data->sigma2 = sigma2;
+        data->M_kk = M_kk;
+        if (np > 0) {
+            if (M_kp.rows() != M || M_kp.cols() != np || M_pp.rows() != np || M_pp.cols() != np) {
+                throw std::invalid_argument("Surrogate: M_kp or M_pp shape mismatch.");
+            }
+            data->M_kp = M_kp;
+            data->M_pp = M_pp;
+        }
+    }
+    return data;
+}
+
+CompiledSurrogate::CompiledSurrogate(
+    SurrogateKernel kernel,
+    int poly_degree,
+    const Eigen::MatrixXd& X_centers,
+    const Eigen::VectorXd& theta,
+    const Eigen::MatrixXd& alpha,
+    const Eigen::MatrixXd& beta_grad,
+    const Eigen::MatrixXd& poly_coef,
+    const Eigen::VectorXd& in_mean,
+    const Eigen::VectorXd& in_inv_std,
+    const Eigen::VectorXd& out_mean,
+    const Eigen::VectorXd& out_std,
+    const Eigen::VectorXd& sigma2,
+    const Eigen::MatrixXd& M_kk,
+    const Eigen::MatrixXd& M_kp,
+    const Eigen::MatrixXd& M_pp,
+    double r_eps,
+    std::string name_)
+    : data(SurrogateEngineData::create(
+          kernel, poly_degree, X_centers, theta, alpha, beta_grad, poly_coef,
+          in_mean, in_inv_std, out_mean, out_std, sigma2, M_kk, M_kp, M_pp, r_eps)),
+      name(std::move(name_)) {}
+
+Eigen::MatrixXd CompiledSurrogate::eval(const Eigen::MatrixXd& X, int num_threads) const {
+    const SurrogateEngineData& D = *data;
+    if (X.rows() != D.d_in) {
+        throw std::invalid_argument("CompiledSurrogate::eval: X rows must equal d_in.");
+    }
+    const Eigen::Index B = X.cols();
+    Eigen::MatrixXd Y(D.d_out, B);
+#ifdef _OPENMP
+    const int threads = (num_threads > 0) ? num_threads : omp_get_max_threads();
+    #pragma omp parallel for schedule(static) num_threads(threads) if (B >= 32 && threads > 1)
+#endif
+    for (Eigen::Index col = 0; col < B; ++col) {
+        Eigen::VectorXd xt = (X.col(col) - D.in_mean).cwiseProduct(D.in_inv_std);
+        Eigen::VectorXd y_col = Eigen::VectorXd::Zero(D.d_out);
+        Eigen::VectorXd u(D.d_in);
+        for (Eigen::Index i = 0; i < D.n_centers; ++i) {
+            u = xt - D.X_centers.col(i);
+            const double q = u.dot(D.theta.cwiseProduct(u));
+            double p0, p1, p2, p3;
+            surrogate_kernel_jet3(D.kernel, q, D.r_eps, p0, p1, p2, p3);
+            y_col.noalias() += p0 * D.alpha.row(i).transpose();
+            if (D.has_grad_basis) {
+                y_col.noalias() -= (2.0 * p1) * (D.beta_scaled.middleRows(i * D.d_in, D.d_in).transpose() * u);
+            }
+        }
+        if (D.n_poly > 0) {
+            Eigen::VectorXd p;
+            eval_poly_basis(xt, D.poly_degree, p);
+            y_col.noalias() += D.poly_coef.transpose() * p;
+        }
+        Y.col(col) = D.out_mean + D.out_std.cwiseProduct(y_col);
+    }
+    return Y;
+}
+
+Eigen::MatrixXd CompiledSurrogate::eval_variance(const Eigen::MatrixXd& X, int num_threads) const {
+    const SurrogateEngineData& D = *data;
+    if (!D.has_variance) {
+        throw std::runtime_error("CompiledSurrogate::eval_variance: variance matrices not provided for this surrogate.");
+    }
+    if (X.rows() != D.d_in) {
+        throw std::invalid_argument("CompiledSurrogate::eval_variance: X rows must equal d_in.");
+    }
+    const Eigen::Index B = X.cols();
+    Eigen::MatrixXd V(D.d_out, B);
+#ifdef _OPENMP
+    const int threads = (num_threads > 0) ? num_threads : omp_get_max_threads();
+    #pragma omp parallel for schedule(static) num_threads(threads) if (B >= 32 && threads > 1)
+#endif
+    for (Eigen::Index col = 0; col < B; ++col) {
+        Eigen::VectorXd xt = (X.col(col) - D.in_mean).cwiseProduct(D.in_inv_std);
+        Eigen::VectorXd k_vec, p_vec;
+        eval_kernel_basis_and_tangent(D, xt, nullptr, k_vec, nullptr);
+        if (D.n_poly > 0) eval_poly_basis(xt, D.poly_degree, p_vec);
+        double v_unclamped = 0.0;
+        eval_cholesky_variance_state(D, k_vec, p_vec, v_unclamped, nullptr, nullptr);
+        const double v_raw = std::max(0.0, v_unclamped);
+        V.col(col) = (D.out_std.array().square() * D.sigma2.array() * v_raw).matrix();
+    }
+    return V;
+}
+
+SurrogateNode::SurrogateNode(Shape out_shape, int x_id,
+                             std::shared_ptr<const SurrogateEngineData> engine_data,
+                             SurrogateOutputMode mode_,
+                             std::string name)
+    : Node(OpType::Surrogate, out_shape, {x_id}, std::move(name)),
+      data(std::move(engine_data)),
+      mode(mode_) {
+    if (mode == SurrogateOutputMode::Variance && !data->has_variance) {
+        throw std::invalid_argument("SurrogateNode: Variance mode requested but surrogate has no variance matrices.");
+    }
+}
+
+void SurrogateNode::forward(Workspace& ws) const {
+    const SurrogateEngineData& D = *data;
+    const Node& in = graph->node(inputs[0]);
+    const auto X = ws.val_mat(in.offset, in.shape);
+    auto Y = ws.val_mat(offset, shape);
+    const Eigen::Index B = shape.cols;
+
+    if (mode == SurrogateOutputMode::Mean) {
+        Eigen::VectorXd u(D.d_in), p;
+        for (Eigen::Index col = 0; col < B; ++col) {
+            Eigen::VectorXd xt = (X.col(col) - D.in_mean).cwiseProduct(D.in_inv_std);
+            Eigen::VectorXd y_col = Eigen::VectorXd::Zero(D.d_out);
+            for (Eigen::Index i = 0; i < D.n_centers; ++i) {
+                u = xt - D.X_centers.col(i);
+                const double q = u.dot(D.theta.cwiseProduct(u));
+                double p0, p1, p2, p3;
+                surrogate_kernel_jet3(D.kernel, q, D.r_eps, p0, p1, p2, p3);
+                y_col.noalias() += p0 * D.alpha.row(i).transpose();
+                if (D.has_grad_basis) {
+                    y_col.noalias() -= (2.0 * p1) * (D.beta_scaled.middleRows(i * D.d_in, D.d_in).transpose() * u);
+                }
+            }
+            if (D.n_poly > 0) {
+                eval_poly_basis(xt, D.poly_degree, p);
+                y_col.noalias() += D.poly_coef.transpose() * p;
+            }
+            Y.col(col) = D.out_mean + D.out_std.cwiseProduct(y_col);
+        }
+    } else {
+        Eigen::VectorXd k_vec, p_vec;
+        for (Eigen::Index col = 0; col < B; ++col) {
+            Eigen::VectorXd xt = (X.col(col) - D.in_mean).cwiseProduct(D.in_inv_std);
+            eval_kernel_basis_and_tangent(D, xt, nullptr, k_vec, nullptr);
+            if (D.n_poly > 0) eval_poly_basis(xt, D.poly_degree, p_vec);
+            double v_unclamped = 0.0;
+            eval_cholesky_variance_state(D, k_vec, p_vec, v_unclamped, nullptr, nullptr);
+            const double v_raw = std::max(0.0, v_unclamped);
+            Y.col(col) = (D.out_std.array().square() * D.sigma2.array() * v_raw).matrix();
+        }
+    }
+}
+
+void SurrogateNode::backward(Workspace& ws) const {
+    const SurrogateEngineData& D = *data;
+    const Node& in = graph->node(inputs[0]);
+    if (!in.requires_grad) return;
+    const auto X = ws.val_mat(in.offset, in.shape);
+    const auto G_out = ws.bar_mat(offset, shape);
+    auto G_in = ws.bar_mat(in.offset, in.shape);
+    const Eigen::Index B = shape.cols;
+
+    if (mode == SurrogateOutputMode::Mean) {
+        Eigen::VectorXd gx(D.d_in);
+        for (Eigen::Index col = 0; col < B; ++col) {
+            Eigen::VectorXd xt = (X.col(col) - D.in_mean).cwiseProduct(D.in_inv_std);
+            Eigen::VectorXd wy = G_out.col(col).cwiseProduct(D.out_std);
+            Eigen::VectorXd w_val = D.alpha * wy;
+            Eigen::VectorXd w_grad;
+            const Eigen::VectorXd* w_grad_ptr = nullptr;
+            if (D.has_grad_basis) {
+                w_grad = D.beta_scaled * wy;
+                w_grad_ptr = &w_grad;
+            }
+            gx.setZero();
+            accum_kernel_lincomb_grad_and_hvp(D, xt, nullptr, w_val, w_grad_ptr, true, &gx, nullptr, 1.0);
+            if (D.n_poly > 0) {
+                Eigen::VectorXd wp = D.poly_coef * wy;
+                accum_poly_grad(xt, wp, D.poly_degree, gx);
+            }
+            G_in.col(col).noalias() += gx.cwiseProduct(D.in_inv_std);
+        }
+    } else {
+        Eigen::VectorXd k_vec, p_vec, gx(D.d_in);
+        for (Eigen::Index col = 0; col < B; ++col) {
+            const double w_var = (G_out.col(col).array() * D.out_std.array().square() * D.sigma2.array()).sum();
+            if (w_var == 0.0) continue;
+            Eigen::VectorXd xt = (X.col(col) - D.in_mean).cwiseProduct(D.in_inv_std);
+            eval_kernel_basis_and_tangent(D, xt, nullptr, k_vec, nullptr);
+            if (D.n_poly > 0) eval_poly_basis(xt, D.poly_degree, p_vec);
+            double v_unclamped = 0.0;
+            Eigen::VectorXd qk, qp;
+            eval_cholesky_variance_state(D, k_vec, p_vec, v_unclamped, &qk, &qp);
+            if (v_unclamped <= 0.0) continue;
+            Eigen::VectorXd qk_val = qk.head(D.n_centers);
+            Eigen::VectorXd qk_grad;
+            const Eigen::VectorXd* qk_grad_ptr = nullptr;
+            if (D.has_grad_basis) {
+                qk_grad = qk.tail(D.n_centers * D.d_in);
+                qk_grad_ptr = &qk_grad;
+            }
+            gx.setZero();
+            accum_kernel_lincomb_grad_and_hvp(D, xt, nullptr, qk_val, qk_grad_ptr, false, &gx, nullptr, -2.0 * w_var);
+            if (D.n_poly > 0) {
+                Eigen::VectorXd wp = (-2.0 * w_var) * qp;
+                accum_poly_grad(xt, wp, D.poly_degree, gx);
+            }
+            G_in.col(col).noalias() += gx.cwiseProduct(D.in_inv_std);
+        }
+    }
+}
+
+void SurrogateNode::forward_tangent(Workspace& ws) const {
+    const SurrogateEngineData& D = *data;
+    const Node& in = graph->node(inputs[0]);
+    if (!in.requires_grad) {
+        ws.dot_mat(offset, shape).setZero();
+        return;
+    }
+    const auto X = ws.val_mat(in.offset, in.shape);
+    const auto dX = ws.dot_mat(in.offset, in.shape);
+    auto dY = ws.dot_mat(offset, shape);
+    const Eigen::Index B = shape.cols;
+
+    if (mode == SurrogateOutputMode::Mean) {
+        Eigen::VectorXd u(D.d_in), tu(D.d_in), tv(D.d_in), dp;
+        for (Eigen::Index col = 0; col < B; ++col) {
+            Eigen::VectorXd xt = (X.col(col) - D.in_mean).cwiseProduct(D.in_inv_std);
+            Eigen::VectorXd vt = dX.col(col).cwiseProduct(D.in_inv_std);
+            tv = D.theta.cwiseProduct(vt);
+            Eigen::VectorXd dy_col = Eigen::VectorXd::Zero(D.d_out);
+            for (Eigen::Index i = 0; i < D.n_centers; ++i) {
+                u = xt - D.X_centers.col(i);
+                tu = D.theta.cwiseProduct(u);
+                const double q = u.dot(tu);
+                const double dq = 2.0 * tu.dot(vt);
+                double p0, p1, p2, p3;
+                surrogate_kernel_jet3(D.kernel, q, D.r_eps, p0, p1, p2, p3);
+                dy_col.noalias() += (p1 * dq) * D.alpha.row(i).transpose();
+                if (D.has_grad_basis) {
+                    const auto Bi = D.beta_scaled.middleRows(i * D.d_in, D.d_in);
+                    dy_col.noalias() -= (2.0 * p2 * dq) * (Bi.transpose() * u) + (2.0 * p1) * (Bi.transpose() * vt);
+                }
+            }
+            if (D.n_poly > 0) {
+                eval_poly_tangent(xt, vt, D.poly_degree, dp);
+                dy_col.noalias() += D.poly_coef.transpose() * dp;
+            }
+            dY.col(col) = D.out_std.cwiseProduct(dy_col);
+        }
+    } else {
+        Eigen::VectorXd k_vec, dk_vec, p_vec, dp_vec;
+        for (Eigen::Index col = 0; col < B; ++col) {
+            Eigen::VectorXd xt = (X.col(col) - D.in_mean).cwiseProduct(D.in_inv_std);
+            Eigen::VectorXd vt = dX.col(col).cwiseProduct(D.in_inv_std);
+            eval_kernel_basis_and_tangent(D, xt, &vt, k_vec, &dk_vec);
+            if (D.n_poly > 0) {
+                eval_poly_basis(xt, D.poly_degree, p_vec);
+                eval_poly_tangent(xt, vt, D.poly_degree, dp_vec);
+            }
+            double v_unclamped = 0.0;
+            Eigen::VectorXd qk, qp;
+            eval_cholesky_variance_state(D, k_vec, p_vec, v_unclamped, &qk, &qp);
+            if (v_unclamped <= 0.0) {
+                dY.col(col).setZero();
+                continue;
+            }
+            double dv = -2.0 * dk_vec.dot(qk);
+            if (D.n_poly > 0) dv -= 2.0 * dp_vec.dot(qp);
+            dY.col(col) = (D.out_std.array().square() * D.sigma2.array() * dv).matrix();
+        }
+    }
+}
+
+void SurrogateNode::backward_hessian(Workspace& ws) const {
+    const SurrogateEngineData& D = *data;
+    const Node& in = graph->node(inputs[0]);
+    if (!in.requires_grad) return;
+    const auto X = ws.val_mat(in.offset, in.shape);
+    const auto dX = ws.dot_mat(in.offset, in.shape);
+    const auto G_out = ws.bar_mat(offset, shape);
+    const auto dG_out = ws.dot_bar_mat(offset, shape);
+    auto dG_in = ws.dot_bar_mat(in.offset, in.shape);
+    const Eigen::Index B = shape.cols;
+
+    if (mode == SurrogateOutputMode::Mean) {
+        Eigen::VectorXd hv(D.d_in);
+        for (Eigen::Index col = 0; col < B; ++col) {
+            Eigen::VectorXd xt = (X.col(col) - D.in_mean).cwiseProduct(D.in_inv_std);
+            Eigen::VectorXd vt = dX.col(col).cwiseProduct(D.in_inv_std);
+            hv.setZero();
+
+            Eigen::VectorXd dwy = dG_out.col(col).cwiseProduct(D.out_std);
+            Eigen::VectorXd dw_val = D.alpha * dwy;
+            Eigen::VectorXd dw_grad;
+            const Eigen::VectorXd* dw_grad_ptr = nullptr;
+            if (D.has_grad_basis) {
+                dw_grad = D.beta_scaled * dwy;
+                dw_grad_ptr = &dw_grad;
+            }
+            accum_kernel_lincomb_grad_and_hvp(D, xt, nullptr, dw_val, dw_grad_ptr, true, &hv, nullptr, 1.0);
+            if (D.n_poly > 0) {
+                Eigen::VectorXd dwp = D.poly_coef * dwy;
+                accum_poly_grad(xt, dwp, D.poly_degree, hv);
+            }
+
+            Eigen::VectorXd wy = G_out.col(col).cwiseProduct(D.out_std);
+            Eigen::VectorXd w_val = D.alpha * wy;
+            Eigen::VectorXd w_grad;
+            const Eigen::VectorXd* w_grad_ptr = nullptr;
+            if (D.has_grad_basis) {
+                w_grad = D.beta_scaled * wy;
+                w_grad_ptr = &w_grad;
+            }
+            accum_kernel_lincomb_grad_and_hvp(D, xt, &vt, w_val, w_grad_ptr, true, nullptr, &hv, 1.0);
+            if (D.n_poly > 0) {
+                Eigen::VectorXd wp = D.poly_coef * wy;
+                accum_poly_hvp(vt, wp, D.poly_degree, hv);
+            }
+
+            dG_in.col(col).noalias() += hv.cwiseProduct(D.in_inv_std);
+        }
+    } else {
+        Eigen::VectorXd k_vec, dk_vec, p_vec, dp_vec, hv(D.d_in);
+        for (Eigen::Index col = 0; col < B; ++col) {
+            const double w_var = (G_out.col(col).array() * D.out_std.array().square() * D.sigma2.array()).sum();
+            const double dw_var = (dG_out.col(col).array() * D.out_std.array().square() * D.sigma2.array()).sum();
+            if (w_var == 0.0 && dw_var == 0.0) continue;
+
+            Eigen::VectorXd xt = (X.col(col) - D.in_mean).cwiseProduct(D.in_inv_std);
+            Eigen::VectorXd vt = dX.col(col).cwiseProduct(D.in_inv_std);
+            eval_kernel_basis_and_tangent(D, xt, &vt, k_vec, &dk_vec);
+            if (D.n_poly > 0) {
+                eval_poly_basis(xt, D.poly_degree, p_vec);
+                eval_poly_tangent(xt, vt, D.poly_degree, dp_vec);
+            }
+            double v_unclamped = 0.0;
+            Eigen::VectorXd qk, qp, dqk, dqp;
+            eval_cholesky_variance_state(D, k_vec, p_vec, v_unclamped, &qk, &qp);
+            if (v_unclamped <= 0.0) continue;
+            eval_cholesky_variance_tangent(D, dk_vec, dp_vec, dqk, dqp);
+
+            hv.setZero();
+            Eigen::VectorXd w_lin_k = (-2.0 * dw_var) * qk - (2.0 * w_var) * dqk;
+            Eigen::VectorXd wl_val = w_lin_k.head(D.n_centers);
+            Eigen::VectorXd wl_grad;
+            const Eigen::VectorXd* wl_grad_ptr = nullptr;
+            if (D.has_grad_basis) {
+                wl_grad = w_lin_k.tail(D.n_centers * D.d_in);
+                wl_grad_ptr = &wl_grad;
+            }
+            accum_kernel_lincomb_grad_and_hvp(D, xt, nullptr, wl_val, wl_grad_ptr, false, &hv, nullptr, 1.0);
+            if (D.n_poly > 0) {
+                Eigen::VectorXd w_lin_p = (-2.0 * dw_var) * qp - (2.0 * w_var) * dqp;
+                accum_poly_grad(xt, w_lin_p, D.poly_degree, hv);
+            }
+
+            if (w_var != 0.0) {
+                Eigen::VectorXd qk_val = qk.head(D.n_centers);
+                Eigen::VectorXd qk_grad;
+                const Eigen::VectorXd* qk_grad_ptr = nullptr;
+                if (D.has_grad_basis) {
+                    qk_grad = qk.tail(D.n_centers * D.d_in);
+                    qk_grad_ptr = &qk_grad;
+                }
+                accum_kernel_lincomb_grad_and_hvp(D, xt, &vt, qk_val, qk_grad_ptr, false, nullptr, &hv, -2.0 * w_var);
+                if (D.n_poly > 0) {
+                    Eigen::VectorXd wp = (-2.0 * w_var) * qp;
+                    accum_poly_hvp(vt, wp, D.poly_degree, hv);
+                }
+            }
+
+            dG_in.col(col).noalias() += hv.cwiseProduct(D.in_inv_std);
+        }
+    }
+}
+
 namespace ops {
 
 namespace {
@@ -3252,6 +7084,97 @@ int scan_subgraph(Graph& g, Shape out_shape, const std::vector<int>& outer_in_id
         out_shape, outer_in_ids, std::move(step_graph), inner_carry_id,
         inner_seq_ids, seq_axes, inner_shared_ids,
         next_carry_out_id, step_y_out_id, num_steps, name));
+}
+
+int mlp(Graph& g, int x_id, std::shared_ptr<const MLPEngineData> engine_data,
+        const std::string& name) {
+    if (!engine_data) {
+        throw std::invalid_argument("ops::mlp requires non-null MLPEngineData.");
+    }
+    const Node& xn = g.node(x_id);
+    if (xn.shape.rows != engine_data->d_in) {
+        throw std::invalid_argument(
+            "ops::mlp input rows (" + std::to_string(xn.shape.rows) +
+            ") must match network d_in (" + std::to_string(engine_data->d_in) + ").");
+    }
+    Shape out_shape(engine_data->d_out, xn.shape.cols);
+    return g.add_node(std::make_shared<MLPNode>(out_shape, x_id, std::move(engine_data), name));
+}
+
+int conv1d(Graph& g, int x_id, std::shared_ptr<const Conv1DEngineData> engine_data,
+           const std::string& name) {
+    if (!engine_data) throw std::invalid_argument("ops::conv1d requires non-null Conv1DEngineData.");
+    const Node& xn = g.node(x_id);
+    if (xn.shape.rows != engine_data->c_in) {
+        throw std::invalid_argument("ops::conv1d: input rows must match c_in.");
+    }
+    const Eigen::Index l_out = engine_data->out_length(xn.shape.cols);
+    return g.add_node(std::make_shared<Conv1DNode>(
+        Shape(engine_data->c_out, l_out), x_id, xn.shape.cols, std::move(engine_data), name));
+}
+
+int attention(Graph& g, int x_id, std::shared_ptr<const AttentionEngineData> engine_data,
+              const std::string& name) {
+    if (!engine_data) throw std::invalid_argument("ops::attention requires non-null AttentionEngineData.");
+    const Node& xn = g.node(x_id);
+    if (xn.shape.rows != engine_data->d_model) {
+        throw std::invalid_argument("ops::attention: input rows must match d_model.");
+    }
+    return g.add_node(std::make_shared<AttentionNode>(
+        Shape(engine_data->d_model, xn.shape.cols), x_id, std::move(engine_data), name));
+}
+
+int conv2d(Graph& g, int x_id, int h_in, int w_in,
+           std::shared_ptr<const Conv2DEngineData> engine_data,
+           const std::string& name) {
+    if (!engine_data) throw std::invalid_argument("ops::conv2d requires non-null Conv2DEngineData.");
+    const Node& xn = g.node(x_id);
+    if (xn.shape.rows != engine_data->c_in || xn.shape.cols != static_cast<Eigen::Index>(h_in) * w_in)
+        throw std::invalid_argument("ops::conv2d: input shape must be (c_in, h_in * w_in).");
+    auto [ho, wo] = engine_data->out_hw(h_in, w_in);
+    return g.add_node(std::make_shared<Conv2DNode>(
+        Shape(engine_data->c_out, static_cast<Eigen::Index>(ho) * wo),
+        x_id, h_in, w_in, ho, wo, std::move(engine_data), name));
+}
+
+int pool2d(Graph& g, int x_id, Pool2DMode mode, int h_in, int w_in,
+           int kh, int kw, int sh, int sw, int ph, int pw,
+           const std::string& name) {
+    if (h_in <= 0 || w_in <= 0 || kh <= 0 || kw <= 0 || sh <= 0 || sw <= 0 || ph < 0 || pw < 0)
+        throw std::invalid_argument("ops::pool2d: invalid spatial/kernel/stride/padding dimensions.");
+    const Node& xn = g.node(x_id);
+    if (xn.shape.cols != static_cast<Eigen::Index>(h_in) * w_in)
+        throw std::invalid_argument("ops::pool2d: input cols must equal h_in * w_in.");
+    const int nh = h_in + 2 * ph - kh;
+    const int nw = w_in + 2 * pw - kw;
+    if (nh < 0 || nw < 0) throw std::invalid_argument("ops::pool2d: input too small for kernel/padding.");
+    const int ho = nh / sh + 1;
+    const int wo = nw / sw + 1;
+    return g.add_node(std::make_shared<Pool2DNode>(
+        Shape(xn.shape.rows, static_cast<Eigen::Index>(ho) * wo),
+        x_id, mode, xn.shape.rows, h_in, w_in, ho, wo, kh, kw, sh, sw, ph, pw, name));
+}
+
+int rms_norm(Graph& g, int x_id, const Eigen::VectorXd& gamma, double eps, const std::string& name) {
+    const Node& xn = g.node(x_id);
+    if (gamma.size() > 0 && gamma.size() != xn.shape.rows)
+        throw std::invalid_argument("ops::rms_norm: gamma size must match input rows.");
+    return g.add_node(std::make_shared<RMSNormNode>(xn.shape, x_id, gamma, eps, name));
+}
+
+
+int surrogate(Graph& g, int x_id, std::shared_ptr<const SurrogateEngineData> engine_data,
+              SurrogateOutputMode mode, const std::string& name) {
+    if (!engine_data) {
+        throw std::invalid_argument("ops::surrogate: engine_data is null.");
+    }
+    const Shape xs = g.node(x_id).shape;
+    if (xs.rows != engine_data->d_in) {
+        throw std::invalid_argument("ops::surrogate: input rows must match surrogate d_in.");
+    }
+    const Shape out_shape(engine_data->d_out, xs.cols);
+    return g.add_node(std::make_unique<SurrogateNode>(
+        out_shape, x_id, std::move(engine_data), mode, name));
 }
 
 } // namespace ops

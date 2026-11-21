@@ -14,7 +14,7 @@ import sys
 import time
 import types
 import numpy as np
-import python.fastopt as fo
+import fastopt as fo
 
 
 def _ensure_pymoo_available_for_test() -> None:

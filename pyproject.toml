@@ -1,6 +1,6 @@
 [build-system]
-requires = ["scikit-build-core>=0.8.0", "nanobind>=2.0.0"]
-build-backend = "scikit_build_core.build"
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastopt"
@@ -15,10 +15,15 @@ dependencies = [
     "pymoo>=0.6.0",
 ]
 
-[tool.scikit-build]
-cmake.build-type = "Release"
-wheel.packages = ["python/fastopt"]
-build-dir = "build/{wheel_tag}"
+[tool.setuptools]
+include-package-data = true
 
-[tool.scikit-build.cmake.define]
-FASTOPT_ENABLE_SIMD = "ON"
+[tool.setuptools.package-dir]
+"" = "python"
+
+[tool.setuptools.packages.find]
+where = ["python"]
+include = ["fastopt*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.pyd", "*.so", "*.dylib", "*.dll", "*.pyi", "py.typed"]

@@ -12,7 +12,7 @@ All comments are written in English.
 import os
 import time
 import numpy as np
-import python.fastopt as fo
+import fastopt as fo
 from fastopt.solvers.ipopt_solver import find_casadi_ipopt_dir
 
 

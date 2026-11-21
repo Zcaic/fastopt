@@ -84,6 +84,18 @@ class OptiSol:
         self._ub = ub if ub is not None else np.full(self._x.size, np.inf)
         self._has_eq = bool(has_eq)
         self._has_ineq = bool(has_ineq)
+        g = opti.cpp_graph
+        self._param_snapshot: List[Tuple[int, np.ndarray]] = [
+            (pid, g.get_parameter_value(pid).copy()) for pid in g.parameter_ids()
+        ]
+
+    def _ensure_params_restored(self) -> None:
+        if not self._param_snapshot:
+            return
+        g = self._opti.cpp_graph
+        for pid, pval in self._param_snapshot:
+            if not np.array_equal(g.get_parameter_value(pid), pval):
+                g.set_parameter_value(pid, pval)
 
     @property
     def x(self) -> np.ndarray:
@@ -134,6 +146,8 @@ class OptiSol:
         """Evaluate any variable, parameter, or intermediate Expr at the optimal solution."""
         if not isinstance(expr, Expr):
             return float(expr) if np.ndim(expr) == 0 else np.asarray(expr, dtype=np.float64)
+        if expr.graph is self._opti.cpp_graph:
+            self._ensure_params_restored()
         if not expr.graph.is_compiled():
             tmp_ev = _core.Evaluator(expr.graph, [expr.id])
             mat = tmp_ev.eval(self._x)[0]
@@ -240,6 +254,7 @@ class OptiSol:
             if p.graph is not self._opti.cpp_graph:
                 raise ValueError("sensitivity parameter belongs to a different Graph.")
 
+        self._ensure_params_restored()
         param_ids = [p.id for p in param_list]
         mult_eq_phys = self._stats.get("mult_eq", np.zeros(0, dtype=np.float64))
         mult_ineq_phys = self._stats.get("mult_ineq", np.zeros(0, dtype=np.float64))
@@ -647,7 +662,7 @@ class Opti(GraphBuilder):
                 f"got shape {self._objective.shape}. Use a multi-objective pymoo solver (e.g. 'NSGA2') for vector objectives."
             )
 
-        cache_key = bool(enable_auto_scale)
+        cache_key = (bool(enable_auto_scale), self._solver_backend == "pymoo")
         if cache_key in self._compiled_cache:
             (
                 evaluator,
@@ -759,7 +774,7 @@ class Opti(GraphBuilder):
                     else:
                         raise ValueError(f"Unsupported comparison operator: {op_str}")
                     if not isinstance(rhs_raw, Expr):
-                        rhs_flat = np.abs(_to_fortran_flat(rhs_raw, _core.Shape(res_expr.size, 1), 1.0))
+                        rhs_flat = np.abs(_to_fortran_flat(rhs_raw, _core.Shape(lhs.shape[0], lhs.shape[1]), 1.0))
                         rhs_mag = np.where(rhs_flat > 1.0, np.clip(rhs_flat, 1.0, 1e6), 1.0)
                     else:
                         rhs_mag = np.ones(res_expr.size, dtype=np.float64)
@@ -772,7 +787,7 @@ class Opti(GraphBuilder):
 
             sz = res_expr.size
             if c_scale_raw is not None:
-                c_sc = np.abs(_to_fortran_flat(c_scale_raw, _core.Shape(sz, 1), 1.0))
+                c_sc = np.abs(_to_fortran_flat(c_scale_raw, _core.Shape(orig_shape[0], orig_shape[1]), 1.0))
                 if np.any(c_sc <= 0.0):
                     raise ValueError("Constraint scale must be strictly positive.")
             elif enable_auto_scale:
@@ -936,7 +951,7 @@ class Opti(GraphBuilder):
                 if isinstance(c.rhs_raw, Expr):
                     rhs_val = evaluator.eval_node(x_vec, c.rhs_raw.id).ravel(order="F")
                 else:
-                    rhs_val = _to_fortran_flat(c.rhs_raw, _core.Shape(lhs_val.size, 1), 0.0)
+                    rhs_val = _to_fortran_flat(c.rhs_raw, _core.Shape(c.lhs.shape[0], c.lhs.shape[1]), 0.0)
                 diff = lhs_val - rhs_val
                 if op_str in ("<=", "<"):
                     viols = np.maximum(0.0, diff)

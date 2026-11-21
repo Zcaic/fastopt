@@ -535,7 +535,543 @@ private:
 };
 
 // ============================================================================
-// 19. Graph Operator Construction Helpers
+// 19. Fused CPU Neural Network Surrogate Operator (MLP / ResNet / LayerNorm)
+// ============================================================================
+enum class NNActivation {
+    Identity = 0,
+    Tanh = 1,
+    SiLU = 2,
+    GELU = 3,
+    ReLU = 4,
+    Softplus = 5,
+    ELU = 6,
+    Sin = 7,
+    Sigmoid = 8,
+    LeakyReLU = 9,
+    Mish = 10,
+    SELU = 11,
+    HardSwish = 12
+};
+
+struct MLPLayerSpec {
+    Eigen::MatrixXd W;
+    Eigen::VectorXd b;
+    NNActivation activation = NNActivation::Tanh;
+    bool residual = false;
+    bool layer_norm = false;
+    Eigen::VectorXd ln_gamma;
+    Eigen::VectorXd ln_beta;
+    double ln_eps = 1e-5;
+};
+
+// Immutable shared weight container (supports zero-copy sharing across nodes
+// and optional float32 mixed-precision storage for 2x AVX2/FMA SIMD throughput).
+struct MLPEngineData {
+    struct LayerD {
+        Eigen::MatrixXd W;
+        Eigen::VectorXd b;
+        NNActivation activation = NNActivation::Tanh;
+        bool residual = false;
+        bool layer_norm = false;
+        Eigen::VectorXd ln_gamma;
+        Eigen::VectorXd ln_beta;
+        double ln_eps = 1e-5;
+        Eigen::Index d_in = 0;
+        Eigen::Index d_out = 0;
+    };
+    struct LayerF {
+        Eigen::MatrixXf W;
+        Eigen::VectorXf b;
+        NNActivation activation = NNActivation::Tanh;
+        bool residual = false;
+        bool layer_norm = false;
+        Eigen::VectorXf ln_gamma;
+        Eigen::VectorXf ln_beta;
+        float ln_eps = 1e-5f;
+        Eigen::Index d_in = 0;
+        Eigen::Index d_out = 0;
+    };
+
+    bool use_float32 = false;
+    Eigen::Index d_in = 0;
+    Eigen::Index d_out = 0;
+    bool has_in_norm = false;
+    bool has_out_norm = false;
+
+    Eigen::VectorXd in_mean_d, in_inv_std_d, out_mean_d, out_std_d;
+    Eigen::VectorXf in_mean_f, in_inv_std_f, out_mean_f, out_std_f;
+
+    std::vector<LayerD> layers_d;
+    std::vector<LayerF> layers_f;
+
+    static std::shared_ptr<const MLPEngineData> create(
+        const std::vector<MLPLayerSpec>& layers,
+        bool use_float32 = false,
+        const Eigen::VectorXd& in_mean = Eigen::VectorXd(),
+        const Eigen::VectorXd& in_inv_std = Eigen::VectorXd(),
+        const Eigen::VectorXd& out_mean = Eigen::VectorXd(),
+        const Eigen::VectorXd& out_std = Eigen::VectorXd());
+};
+
+// Standalone compiled MLP handle for direct numeric evaluation and zero-copy
+// insertion into one or more fastopt AD graphs.
+class CompiledMLP {
+public:
+    std::shared_ptr<const MLPEngineData> data;
+    std::string name;
+
+    CompiledMLP(const std::vector<MLPLayerSpec>& layers,
+                bool use_float32 = false,
+                const Eigen::VectorXd& in_mean = Eigen::VectorXd(),
+                const Eigen::VectorXd& in_inv_std = Eigen::VectorXd(),
+                const Eigen::VectorXd& out_mean = Eigen::VectorXd(),
+                const Eigen::VectorXd& out_std = Eigen::VectorXd(),
+                std::string name_ = "");
+
+    Eigen::Index d_in() const { return data->d_in; }
+    Eigen::Index d_out() const { return data->d_out; }
+    int num_layers() const {
+        return static_cast<int>(data->use_float32 ? data->layers_f.size() : data->layers_d.size());
+    }
+    bool use_float32() const { return data->use_float32; }
+
+    // Direct numeric evaluation for arbitrary batch matrix X of shape (d_in, B).
+    // Thread-safe and GIL-free; automatically uses OpenMP column blocking for large B.
+    Eigen::MatrixXd eval(const Eigen::MatrixXd& X, int num_threads = 0) const;
+};
+
+class MLPNode : public Node {
+public:
+    std::shared_ptr<const MLPEngineData> data;
+    Eigen::Index batch_cols = 1;
+
+    MLPNode(Shape out_shape, int x_id,
+            std::shared_ptr<const MLPEngineData> engine_data,
+            std::string name = "");
+
+    void forward(Workspace& ws) const override;
+    void backward(Workspace& ws) const override;
+    void forward_tangent(Workspace& ws) const override;
+    void backward_hessian(Workspace& ws) const override;
+
+private:
+    struct ScratchD;
+    struct ScratchF;
+    mutable std::vector<std::shared_ptr<ScratchD>> thread_scratch_d_;
+    mutable std::vector<std::shared_ptr<ScratchF>> thread_scratch_f_;
+
+    ScratchD& ensure_scratch_d(int tid) const;
+    ScratchF& ensure_scratch_f(int tid) const;
+};
+
+// Fused 1D Convolution (im2col + BLAS3 GEMM + fused activation, fp32/fp64, 0/1/2 AD)
+struct Conv1DEngineData {
+    bool use_float32 = false;
+    Eigen::Index c_in = 0;
+    Eigen::Index c_out = 0;
+    int kernel_size = 1;
+    int stride = 1;
+    int padding = 0;
+    int dilation = 1;
+    NNActivation activation = NNActivation::Identity;
+
+    // W has shape (c_out, c_in * kernel_size)
+    Eigen::MatrixXd W_d;
+    Eigen::VectorXd b_d;
+    Eigen::MatrixXf W_f;
+    Eigen::VectorXf b_f;
+
+    Eigen::Index out_length(Eigen::Index l_in) const {
+        const Eigen::Index eff_k = static_cast<Eigen::Index>(dilation) * (kernel_size - 1) + 1;
+        const Eigen::Index num = l_in + 2 * static_cast<Eigen::Index>(padding) - eff_k;
+        if (num < 0) {
+            throw std::invalid_argument("Conv1D: input length too small for kernel_size/dilation/padding.");
+        }
+        return num / static_cast<Eigen::Index>(stride) + 1;
+    }
+
+    static std::shared_ptr<const Conv1DEngineData> create(
+        const Eigen::MatrixXd& W,
+        const Eigen::VectorXd& b,
+        int c_in,
+        int kernel_size,
+        int stride = 1,
+        int padding = 0,
+        int dilation = 1,
+        NNActivation activation = NNActivation::Identity,
+        bool use_float32 = false);
+};
+
+class CompiledConv1D {
+public:
+    std::shared_ptr<const Conv1DEngineData> data;
+    std::string name;
+
+    CompiledConv1D(const Eigen::MatrixXd& W,
+                   const Eigen::VectorXd& b,
+                   int c_in,
+                   int kernel_size,
+                   int stride = 1,
+                   int padding = 0,
+                   int dilation = 1,
+                   NNActivation activation = NNActivation::Identity,
+                   bool use_float32 = false,
+                   std::string name_ = "");
+
+    Eigen::Index c_in() const { return data->c_in; }
+    Eigen::Index c_out() const { return data->c_out; }
+    int kernel_size() const { return data->kernel_size; }
+    int stride() const { return data->stride; }
+    int padding() const { return data->padding; }
+    int dilation() const { return data->dilation; }
+    bool use_float32() const { return data->use_float32; }
+
+    Eigen::MatrixXd eval(const Eigen::MatrixXd& X) const;
+};
+
+class Conv1DNode : public Node {
+public:
+    std::shared_ptr<const Conv1DEngineData> data;
+    Eigen::Index l_in = 0;
+    Eigen::Index l_out = 0;
+
+    Conv1DNode(Shape out_shape, int x_id, Eigen::Index l_in_,
+               std::shared_ptr<const Conv1DEngineData> engine_data,
+               std::string name = "");
+
+    void forward(Workspace& ws) const override;
+    void backward(Workspace& ws) const override;
+    void forward_tangent(Workspace& ws) const override;
+    void backward_hessian(Workspace& ws) const override;
+
+private:
+    struct ScratchD;
+    struct ScratchF;
+    mutable std::vector<std::shared_ptr<ScratchD>> thread_scratch_d_;
+    mutable std::vector<std::shared_ptr<ScratchF>> thread_scratch_f_;
+
+    ScratchD& ensure_scratch_d(int tid) const;
+    ScratchF& ensure_scratch_f(int tid) const;
+};
+
+// Fused Multi-Head Self-Attention (Q/K/V/O linear projections + scaled dot-product softmax
+// + optional causal mask & residual skip, fp32/fp64, exact 0/1/2 AD)
+struct AttentionEngineData {
+    bool use_float32 = false;
+    Eigen::Index d_model = 0;
+    int num_heads = 1;
+    Eigen::Index d_head = 0;
+    double scale = 1.0;
+    bool causal = false;
+    bool residual = false;
+
+    Eigen::MatrixXd Wq_d, Wk_d, Wv_d, Wo_d;
+    Eigen::VectorXd bq_d, bk_d, bv_d, bo_d;
+    Eigen::MatrixXf Wq_f, Wk_f, Wv_f, Wo_f;
+    Eigen::VectorXf bq_f, bk_f, bv_f, bo_f;
+
+    static std::shared_ptr<const AttentionEngineData> create(
+        const Eigen::MatrixXd& Wq, const Eigen::VectorXd& bq,
+        const Eigen::MatrixXd& Wk, const Eigen::VectorXd& bk,
+        const Eigen::MatrixXd& Wv, const Eigen::VectorXd& bv,
+        const Eigen::MatrixXd& Wo, const Eigen::VectorXd& bo,
+        int num_heads,
+        bool causal = false,
+        bool residual = false,
+        bool use_float32 = false);
+};
+
+class CompiledAttention {
+public:
+    std::shared_ptr<const AttentionEngineData> data;
+    std::string name;
+
+    CompiledAttention(const Eigen::MatrixXd& Wq, const Eigen::VectorXd& bq,
+                      const Eigen::MatrixXd& Wk, const Eigen::VectorXd& bk,
+                      const Eigen::MatrixXd& Wv, const Eigen::VectorXd& bv,
+                      const Eigen::MatrixXd& Wo, const Eigen::VectorXd& bo,
+                      int num_heads,
+                      bool causal = false,
+                      bool residual = false,
+                      bool use_float32 = false,
+                      std::string name_ = "");
+
+    Eigen::Index d_model() const { return data->d_model; }
+    int num_heads() const { return data->num_heads; }
+    bool causal() const { return data->causal; }
+    bool residual() const { return data->residual; }
+    bool use_float32() const { return data->use_float32; }
+
+    Eigen::MatrixXd eval(const Eigen::MatrixXd& X) const;
+};
+
+class AttentionNode : public Node {
+public:
+    std::shared_ptr<const AttentionEngineData> data;
+    Eigen::Index seq_len = 0;
+
+    AttentionNode(Shape out_shape, int x_id,
+                  std::shared_ptr<const AttentionEngineData> engine_data,
+                  std::string name = "");
+
+    void forward(Workspace& ws) const override;
+    void backward(Workspace& ws) const override;
+    void forward_tangent(Workspace& ws) const override;
+    void backward_hessian(Workspace& ws) const override;
+
+private:
+    struct ScratchD;
+    struct ScratchF;
+    mutable std::vector<std::shared_ptr<ScratchD>> thread_scratch_d_;
+    mutable std::vector<std::shared_ptr<ScratchF>> thread_scratch_f_;
+
+    ScratchD& ensure_scratch_d(int tid) const;
+    ScratchF& ensure_scratch_f(int tid) const;
+};
+
+// Fused 2D Convolution (im2col_2d + BLAS3 GEMM + fused activation, fp32/fp64, 0/1/2 AD)
+// Spatial layout: input (C_in, H_in * W_in) -> output (C_out, H_out * W_out).
+struct Conv2DEngineData {
+    bool use_float32 = false;
+    Eigen::Index c_in = 0;
+    Eigen::Index c_out = 0;
+    int kh = 1, kw = 1;
+    int sh = 1, sw = 1;
+    int ph = 0, pw = 0;
+    int dh = 1, dw = 1;
+    NNActivation activation = NNActivation::Identity;
+
+    // W has shape (c_out, c_in * kh * kw)
+    Eigen::MatrixXd W_d;
+    Eigen::VectorXd b_d;
+    Eigen::MatrixXf W_f;
+    Eigen::VectorXf b_f;
+
+    std::pair<int, int> out_hw(int h_in, int w_in) const {
+        const int eff_kh = dh * (kh - 1) + 1;
+        const int eff_kw = dw * (kw - 1) + 1;
+        const int nh = h_in + 2 * ph - eff_kh;
+        const int nw = w_in + 2 * pw - eff_kw;
+        if (nh < 0 || nw < 0) {
+            throw std::invalid_argument("Conv2D: input (H, W) too small for kernel/dilation/padding.");
+        }
+        return {nh / sh + 1, nw / sw + 1};
+    }
+
+    static std::shared_ptr<const Conv2DEngineData> create(
+        const Eigen::MatrixXd& W, const Eigen::VectorXd& b,
+        int c_in, int kh, int kw,
+        int sh = 1, int sw = 1, int ph = 0, int pw = 0, int dh = 1, int dw = 1,
+        NNActivation activation = NNActivation::Identity,
+        bool use_float32 = false);
+};
+
+class CompiledConv2D {
+public:
+    std::shared_ptr<const Conv2DEngineData> data;
+    std::string name;
+
+    CompiledConv2D(const Eigen::MatrixXd& W, const Eigen::VectorXd& b,
+                   int c_in, int kh, int kw,
+                   int sh = 1, int sw = 1, int ph = 0, int pw = 0, int dh = 1, int dw = 1,
+                   NNActivation activation = NNActivation::Identity,
+                   bool use_float32 = false, std::string name_ = "");
+
+    Eigen::Index c_in() const { return data->c_in; }
+    Eigen::Index c_out() const { return data->c_out; }
+    std::pair<int, int> out_hw(int h_in, int w_in) const { return data->out_hw(h_in, w_in); }
+    Eigen::MatrixXd eval(const Eigen::MatrixXd& X, int h_in, int w_in) const;
+};
+
+class Conv2DNode : public Node {
+public:
+    std::shared_ptr<const Conv2DEngineData> data;
+    int h_in = 0, w_in = 0, h_out = 0, w_out = 0;
+
+    Conv2DNode(Shape out_shape, int x_id, int h_in_, int w_in_, int h_out_, int w_out_,
+               std::shared_ptr<const Conv2DEngineData> engine_data, std::string name = "");
+
+    void forward(Workspace& ws) const override;
+    void backward(Workspace& ws) const override;
+    void forward_tangent(Workspace& ws) const override;
+    void backward_hessian(Workspace& ws) const override;
+
+private:
+    struct ScratchD;
+    struct ScratchF;
+    mutable std::vector<std::shared_ptr<ScratchD>> thread_scratch_d_;
+    mutable std::vector<std::shared_ptr<ScratchF>> thread_scratch_f_;
+    ScratchD& ensure_scratch_d(int tid) const;
+    ScratchF& ensure_scratch_f(int tid) const;
+};
+
+// 2D Spatial Pooling (AvgPool2D / MaxPool2D, exact 0/1/2 AD & local window sparsity)
+enum class Pool2DMode { Avg = 0, Max = 1 };
+
+class Pool2DNode : public Node {
+public:
+    Pool2DMode mode = Pool2DMode::Avg;
+    Eigen::Index channels = 0;
+    int h_in = 0, w_in = 0, h_out = 0, w_out = 0;
+    int kh = 2, kw = 2, sh = 2, sw = 2, ph = 0, pw = 0;
+
+    Pool2DNode(Shape out_shape, int x_id, Pool2DMode mode_,
+               Eigen::Index channels_, int h_in_, int w_in_, int h_out_, int w_out_,
+               int kh_, int kw_, int sh_, int sw_, int ph_, int pw_,
+               std::string name = "");
+
+    void forward(Workspace& ws) const override;
+    void backward(Workspace& ws) const override;
+    void forward_tangent(Workspace& ws) const override;
+    void backward_hessian(Workspace& ws) const override;
+
+private:
+    mutable std::vector<std::vector<Eigen::Index>> thread_argmax_;
+    std::vector<Eigen::Index>& ensure_argmax(int tid) const;
+};
+
+// Native C++ RMSNorm (column-wise root-mean-square normalization with affine gamma, exact 0/1/2 AD)
+class RMSNormNode : public Node {
+public:
+    Eigen::VectorXd gamma;
+    double eps = 1e-6;
+    Eigen::Index dim = 0;
+    Eigen::Index cols = 1;
+
+    RMSNormNode(Shape out_shape, int x_id, Eigen::VectorXd gamma_, double eps_ = 1e-6, std::string name = "");
+
+    void forward(Workspace& ws) const override;
+    void backward(Workspace& ws) const override;
+    void forward_tangent(Workspace& ws) const override;
+    void backward_hessian(Workspace& ws) const override;
+};
+
+
+// Native C++17 Kernel Surrogate Engine (RBF, Ordinary/Universal Kriging, KPLS, GEK, GEKPLS, Co-Kriging)
+// Supports 7 radial/anisotropic kernels, polynomial trend (deg -1/0/1/2), value + gradient basis,
+// and exact 0th, 1st (VJP/JVP), and 2nd-order (Forward-over-Reverse HVP) AD for both Mean and Variance.
+enum class SurrogateKernel {
+    Gaussian = 0,
+    Multiquadric = 1,
+    InvMultiquadric = 2,
+    Cubic = 3,
+    ThinPlateSpline = 4,
+    Matern32 = 5,
+    Matern52 = 6
+};
+
+enum class SurrogateOutputMode {
+    Mean = 0,
+    Variance = 1
+};
+
+struct SurrogateEngineData {
+    SurrogateKernel kernel = SurrogateKernel::Gaussian;
+    int poly_degree = 0; // -1: none, 0: const, 1: linear, 2: quadratic
+    Eigen::Index d_in = 0;
+    Eigen::Index d_out = 0;
+    Eigen::Index n_centers = 0;
+    Eigen::Index n_poly = 0;
+    bool has_grad_basis = false;
+    bool has_variance = false;
+    double r_eps = 1e-14;
+
+    Eigen::MatrixXd X_centers;    // (d_in, n_centers) normalized training centers
+    Eigen::VectorXd theta;        // (d_in,) positive inverse squared lengthscales
+    Eigen::VectorXd in_mean;      // (d_in,)
+    Eigen::VectorXd in_inv_std;   // (d_in,)
+    Eigen::VectorXd out_mean;     // (d_out,)
+    Eigen::VectorXd out_std;      // (d_out,)
+
+    Eigen::MatrixXd alpha;        // (n_centers, d_out) value basis weights
+    Eigen::MatrixXd beta_scaled;  // (d_in * n_centers, d_out) pre-multiplied by theta (empty if !has_grad_basis)
+    Eigen::MatrixXd poly_coef;    // (n_poly, d_out) polynomial trend weights
+
+    // Variance quadratic form in normalized space:
+    // V(x) = 1 - k^T M_kk k - 2 k^T M_kp p + p^T M_pp p
+    Eigen::VectorXd sigma2;       // (d_out,) process variance in normalized space
+    Eigen::MatrixXd M_kk;         // (M_basis, M_basis)
+    Eigen::MatrixXd M_kp;         // (M_basis, n_poly)
+    Eigen::MatrixXd M_pp;         // (n_poly, n_poly)
+
+    static Eigen::Index poly_dim(Eigen::Index d, int deg) {
+        if (deg < 0) return 0;
+        if (deg == 0) return 1;
+        if (deg == 1) return 1 + d;
+        return 1 + d + (d * (d + 1)) / 2;
+    }
+
+    static std::shared_ptr<const SurrogateEngineData> create(
+        SurrogateKernel kernel,
+        int poly_degree,
+        const Eigen::MatrixXd& X_centers,
+        const Eigen::VectorXd& theta,
+        const Eigen::MatrixXd& alpha,
+        const Eigen::MatrixXd& beta_grad = Eigen::MatrixXd(),
+        const Eigen::MatrixXd& poly_coef = Eigen::MatrixXd(),
+        const Eigen::VectorXd& in_mean = Eigen::VectorXd(),
+        const Eigen::VectorXd& in_inv_std = Eigen::VectorXd(),
+        const Eigen::VectorXd& out_mean = Eigen::VectorXd(),
+        const Eigen::VectorXd& out_std = Eigen::VectorXd(),
+        const Eigen::VectorXd& sigma2 = Eigen::VectorXd(),
+        const Eigen::MatrixXd& M_kk = Eigen::MatrixXd(),
+        const Eigen::MatrixXd& M_kp = Eigen::MatrixXd(),
+        const Eigen::MatrixXd& M_pp = Eigen::MatrixXd(),
+        double r_eps = 1e-14);
+};
+
+class CompiledSurrogate {
+public:
+    std::shared_ptr<const SurrogateEngineData> data;
+    std::string name;
+
+    CompiledSurrogate(
+        SurrogateKernel kernel,
+        int poly_degree,
+        const Eigen::MatrixXd& X_centers,
+        const Eigen::VectorXd& theta,
+        const Eigen::MatrixXd& alpha,
+        const Eigen::MatrixXd& beta_grad = Eigen::MatrixXd(),
+        const Eigen::MatrixXd& poly_coef = Eigen::MatrixXd(),
+        const Eigen::VectorXd& in_mean = Eigen::VectorXd(),
+        const Eigen::VectorXd& in_inv_std = Eigen::VectorXd(),
+        const Eigen::VectorXd& out_mean = Eigen::VectorXd(),
+        const Eigen::VectorXd& out_std = Eigen::VectorXd(),
+        const Eigen::VectorXd& sigma2 = Eigen::VectorXd(),
+        const Eigen::MatrixXd& M_kk = Eigen::MatrixXd(),
+        const Eigen::MatrixXd& M_kp = Eigen::MatrixXd(),
+        const Eigen::MatrixXd& M_pp = Eigen::MatrixXd(),
+        double r_eps = 1e-14,
+        std::string name_ = "");
+
+    Eigen::Index d_in() const { return data->d_in; }
+    Eigen::Index d_out() const { return data->d_out; }
+    Eigen::Index n_centers() const { return data->n_centers; }
+    bool has_grad_basis() const { return data->has_grad_basis; }
+    bool has_variance() const { return data->has_variance; }
+
+    Eigen::MatrixXd eval(const Eigen::MatrixXd& X, int num_threads = 0) const;
+    Eigen::MatrixXd eval_variance(const Eigen::MatrixXd& X, int num_threads = 0) const;
+};
+
+class SurrogateNode : public Node {
+public:
+    std::shared_ptr<const SurrogateEngineData> data;
+    SurrogateOutputMode mode = SurrogateOutputMode::Mean;
+
+    SurrogateNode(Shape out_shape, int x_id,
+                  std::shared_ptr<const SurrogateEngineData> engine_data,
+                  SurrogateOutputMode mode_ = SurrogateOutputMode::Mean,
+                  std::string name = "");
+
+    void forward(Workspace& ws) const override;
+    void backward(Workspace& ws) const override;
+    void forward_tangent(Workspace& ws) const override;
+    void backward_hessian(Workspace& ws) const override;
+};
+
+// ============================================================================
+// 20. Graph Operator Construction Helpers
 // ============================================================================
 namespace ops {
 
@@ -599,6 +1135,22 @@ int scan_subgraph(Graph& g, Shape out_shape, const std::vector<int>& outer_in_id
                   const std::vector<int>& inner_shared_ids,
                   int next_carry_out_id, int step_y_out_id, int num_steps,
                   const std::string& name = "");
+int mlp(Graph& g, int x_id, std::shared_ptr<const MLPEngineData> engine_data,
+        const std::string& name = "");
+int conv1d(Graph& g, int x_id, std::shared_ptr<const Conv1DEngineData> engine_data,
+           const std::string& name = "");
+int attention(Graph& g, int x_id, std::shared_ptr<const AttentionEngineData> engine_data,
+              const std::string& name = "");
+int conv2d(Graph& g, int x_id, int h_in, int w_in,
+           std::shared_ptr<const Conv2DEngineData> engine_data,
+           const std::string& name = "");
+int pool2d(Graph& g, int x_id, Pool2DMode mode, int h_in, int w_in,
+           int kh, int kw, int sh = 2, int sw = 2, int ph = 0, int pw = 0,
+           const std::string& name = "");
+int rms_norm(Graph& g, int x_id, const Eigen::VectorXd& gamma,
+             double eps = 1e-6, const std::string& name = "");
+int surrogate(Graph& g, int x_id, std::shared_ptr<const SurrogateEngineData> engine_data,
+              SurrogateOutputMode mode = SurrogateOutputMode::Mean, const std::string& name = "");
 
 } // namespace ops
 

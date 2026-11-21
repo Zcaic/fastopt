@@ -2,7 +2,10 @@
 fastopt: High-performance C++17 tensor-level automatic differentiation and optimization framework.
 """
 
-from ._fastopt_impl import Evaluator, Graph, IpoptResult, OpType, Shape, solve_ipopt_cpp
+from ._fastopt_impl import CompiledMLP, Evaluator, Graph, IpoptResult, NNActivation, OpType, Shape, solve_ipopt_cpp
+from . import nn
+from . import surrogate
+from .bemt_bridge import BEMTSymbolicOutput, FastBEMTAdapter
 from .blackbox import BlackBox, CBlackBox, CustomOp, blackbox, c_blackbox
 from .expr import (
     ComparisonExpr,
@@ -88,6 +91,10 @@ from .opti import Opti, OptiSol
 __all__ = [
     "Shape",
     "OpType",
+    "NNActivation",
+    "CompiledMLP",
+    "nn",
+    "surrogate",
     "Graph",
     "Evaluator",
     "IpoptResult",
@@ -95,6 +102,8 @@ __all__ = [
     "CustomOp",
     "BlackBox",
     "blackbox",
+    "BEMTSymbolicOutput",
+    "FastBEMTAdapter",
     "CBlackBox",
     "c_blackbox",
     "Expr",

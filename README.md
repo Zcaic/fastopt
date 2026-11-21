@@ -566,3 +566,92 @@ print("Hessian colors required:", ev.num_hessian_colors())             # 3 color
 | `fo.CBlackBox.from_capsule(capsule, shape=(1, 1), *, fd_step=1e-7, fd_hessian=True, jac_sparsity=None, name="c_blackbox", keep_alive=None)` | 从封装了 `FastOptCBlackBox*` 的 `PyCapsule` 构建零 GIL C-ABI 黑盒算子 | `CBlackBox` |
 | `fo.CBlackBox.from_pointers(eval_ptr, shape=(1, 1), *, jac_ptr=0, hvp_ptr=0, batch_ptr=0, user_data_ptr=0, is_thread_safe=True, fd_step=1e-7, fd_hessian=True, jac_sparsity=None, name="c_blackbox", keep_alive=None)` | 从原始函数指针地址 (`uintptr_t`) 或 `ctypes` 函数对象构建零 GIL C-ABI 黑盒算子 | `CBlackBox` |
 | `fo.CBlackBox.from_dll(dll_path, eval_symbol, shape=(1, 1), *, jac_symbol=None, hvp_symbol=None, batch_symbol=None, user_data_ptr=0, is_thread_safe=True, fd_step=1e-7, fd_hessian=True, jac_sparsity=None, name="", keep_alive=None)` | 直接加载编译好的 `.dll` / `.so` / `.dylib` 动态库并绑定导出的 C-ABI 符号 | `CBlackBox` |
+
+---
+
+### 11. `fast_bemt` 联合气动计算与旋翼优化指南 (`FastBEMTAdapter` & `BEMTSymbolicOutput`)
+
+`fastopt` 内置了针对 **`fast_bemt`**（全象限可微斜入流叶素动量理论与 Pitt-Peters 动态入流求解器）的原级双通道桥接层 `fo.FastBEMTAdapter`（位于 `fastopt/bemt_bridge.py`），同时支持：
+1. **零 GIL C-ABI `PyCapsule` 直连通道（`use_c_abi=True` / `'auto'`）**：通过 `fast_bemt` 导出的 `BEMTSolver.fastopt_capsule` 与 `create_blade_design_capsule`（定义于 `fast_bemt/include/bemt/fastopt_c_abi.hpp`），将 C++ `fastopt::Evaluator` 与 C++ `bemt::BEMTSolver` 通过二进制兼容的 `FastOptCBlackBox*` 函数指针直接连通。求解与敏度回传全程在 C++ 层执行，零 Python GIL 锁开销，且天然支持 OpenMP 多线程批量求值（`solve_batch` / `eval_batch`）。
+2. **开箱即用 Python 解析 IFT 通道（`use_c_abi=False`）**：无需重新编译已有的 `fast_bemt` 二进制库，直接调用 `BEMTSolver.solve(cond, compute_gradients=True)` 并复用其一阶隐函数定理（IFT）解析梯度（`dForces_dCond`、`d*_dchord_ctrl`、`d*_dtwist_ctrl`）。
+
+#### 11.1 `FastBEMTAdapter` 与 `BEMTSymbolicOutput` 接口速查
+
+| 类与方法签名 | 参数说明与默认值 | 返回值与符号属性 |
+| :--- | :--- | :--- |
+| `adapter = fo.FastBEMTAdapter(geom, cfg=None, base_cond=None, *, use_c_abi="auto", fd_step=1e-5, fd_hessian=True, name="fast_bemt")` | `geom`: `fast_bemt.RotorGeometry` 实例；`cfg`: `fast_bemt.SolverConfig`；`base_cond`: 基准 `OperatingCondition`；`use_c_abi`: `'auto'`（自动优先启用零 GIL C-ABI）、`True` 或 `False` | `FastBEMTAdapter` 桥接器实例 |
+| `res = adapter.solve_condition(cond=None, *, v_inf=None, alpha_disk_rad=0.0, omega=None, pitch_0=None, beta_rad=0.0, compute_gradients=True)` | 直接调用底层 `BEMTSolver` 解算单点工况（支持传入 `OperatingCondition` 或自由流参数 `v_inf, alpha_disk_rad`） | `fast_bemt.BEMTResult`（含六分量气动力、展向载荷分布 `dT_dr_mean`、入流角 `phi`、迎角 `alpha`、尾迹倾角 `wake_skew_chi` 与解析敏度 `sensitivity`） |
+| `aero = adapter(*, chord_ctrl=None, twist_ctrl=None, omega=None, pitch_0=None, vx=None, vy=None, vz=None, v_inf=None, alpha_disk_rad=None, beta_rad=None)` | 将任意符号变量 `Expr`（或数值）绑定到 `fast_bemt`：既支持仅传入工况变量（配平/轨迹模式），也支持同时传入 `chord_ctrl` 与 `twist_ctrl`（桨叶外形+配平耦合设计模式） | `BEMTSymbolicOutput`：包含 `.thrust` ($T$)、`.torque` ($Q$)、`.power` ($P$)、`.fx`、`.fy`、`.mx`、`.my`、展向分布 `.chord_r`、`.twist_r`、符号梯形积分单叶面积 `.blade_area`、旋翼实度 `.solidity` 与悬停品质因数 `.figure_of_merit` |
+| `surr = adapter.build_polar_surrogate_2d(v_inf_grid, pitch_0_grid, *, alpha_disk_rad=0.0, omega=None, beta_rad=0.0, degree=3)` | 基于 C++ OpenMP `Evaluator.eval_batch` 并行扫掠二维包线网格 `(v_inf_grid, pitch_0_grid)`，自动构建 `thrust`、`torque`、`power`、`fx`、`mx`、`my` 的 $C^2$ 二维 B 样条代理曲面 | 字典 `{'v_inf_grid', 'pitch_0_grid', 'tables', 'splines'}`，其中 `splines['thrust']` 为 `BSplineInterpolator2D` |
+
+#### 11.2 典型旋翼气动计算与优化工程案例（详见 `tests/test_phase13_fast_bemt_integration.py`）
+
+1. **案例 1：斜入流旋翼单点气动计算、耦合 IFT 雅可比验证与二维包线 B 样条代理建模**
+   - 计算三叶旋翼（$R=1.25\text{ m}$）在斜入流前飞工况（$V_\infty=25\text{ m/s}, \alpha_{\text{disk}}=45^\circ, \beta=10^\circ, \Omega=180\text{ rad/s}, \theta_0=10^\circ$）下的六分量气动力/力矩与 Pitt-Peters 尾迹倾角；
+   - 验证 `chord_ctrl (6) + twist_ctrl (6) + [omega, pitch_0, v_inf, alpha_disk] (4)` 共 16 维耦合输入的 $7\times 16$ 解析 IFT 雅可比矩阵（与中心差分相对误差 $7.91\times 10^{-11}$）；
+   - 通过 `adapter.build_polar_surrogate_2d` 并行生成 $9\times 8=72$ 点飞行包线二维三次 B 样条代理曲面及解析操纵导数曲面 $\partial T / \partial \theta_0$。
+2. **案例 2：悬停状态桨叶平面形状（弦长控制点 `chord_ctrl`）与扭转分布（`twist_ctrl`）气动优化**
+   - 在目标悬停拉力 $T_{\text{req}} = 2800\text{ N}$ 与实度上限约束 $\sigma \le \sigma_0$（由符号梯形积分 `aero.solidity` 精确约束）、展向尖削度单调性及二阶差分光顺正则化下最小化悬停轴功率；
+   - 仅耗时 **10.2 ms** 即完成 13 维设计变量寻优，悬停轴功率从 **59.144 kW 降至 52.097 kW（节电 11.92%）**，悬停品质因数 `FM` 从 **0.7224 提升至 0.8201（+9.77 个百分点）**。
+3. **案例 3：倾转旋翼多设计点（悬停 Hover + 高速巡航 Cruise）耦合外形与总距综合优化**
+   - 在同一个 `fo.Opti` 模型中实例化悬停与巡航两个 `FastBEMTAdapter` 算子，共享同一组桨叶 B 样条控制点 `(chord_ctrl, twist_ctrl)` 并独立解算两模态总距角 `(pitch_hov, pitch_cru)`，同时满足 $T_{\text{hover}} = 2800\text{ N}$ 与 $T_{\text{cruise}} = 750\text{ N}$，实现综合加权任务功率下降 **9.97%**（悬停功率下降 10.81%，巡航功率下降 8.22%）。
+4. **案例 4：倾转过渡走廊参数化配平扫掠（`opti.solve_sweep`）与后验 KKT 灵敏度分析（`sol.sensitivity`）**
+   - 将飞行速度 $V_\infty$、桨盘倾角 $\alpha_{\text{disk}}$ 与需求推力 $T_{\text{req}}$ 声明为冻结参数 `opti.parameter`，零重编译热启动扫掠 6 个倾转过渡走廊配平点，并通过 `sol.sensitivity(t_req_p, target="f")` 直接提取边际需用功率灵敏度 $\mathrm{d}P^*/\mathrm{d}T_{\text{req}} = 41.01\text{ W/N}$（与有限差分完全吻合）。
+
+#### 11.3 Phase 14 倾转旋翼高阶增强特性与 5 截面 CST 翼型耦合优化案例（详见 `tests/test_phase14_tiltrotor_enhancements.py`）
+
+针对倾转旋翼大包线跨模态优化需求，`fast_bemt` 与 `fastopt` 在 Phase 14 新增了 6 项核心能力：
+1. **C++ 线程局部同点流场缓存**：`fastopt_c_abi.hpp` 中的 `CondCapsuleHolder` 与 `BladeDesignCapsuleHolder` 在同一点先后调用 `eval_cb` 与 `jac_cb` 时自动复用已收敛的流场（`phi*`, `pitt_kx*`），直接跳过重复的 BEMT 迭代。
+2. **OpenMP 并行多设计点 C-ABI 算子（`adapter.eval_multipoint(...)`）**：在 C++ `MultiPointBladeCapsuleHolder` 中一次解包几何、OpenMP 并行解算全部 $K$ 个设计点，并向 `fastopt` 传递分块稀疏雅可比掩码。
+3. **C++ 内嵌隐式总距自动配平（`auto_trim_thrust=...`）**：通过 `AutoTrimBladeCapsuleHolder` 在 C++ 内部以阻尼牛顿法求解 $T(\theta_0^*, x) = T_{\text{req}}$ 并利用隐函数定理（IFT）消去 `pitch_0`，彻底根除外层试探步越界失速问题。
+4. **2D B 样条控制点径向横坐标（`chord_ctrl_r`, `twist_ctrl_r`）与 5 截面 Kulfan CST 翼型优化（`cst_params` + `adapter.cst_thickness(...)`）**：支持全耦合“平面形状 + 扭转 + 展向翼型 + 结构厚度”寻优。
+5. **周期变距解析导数（`pitch_1c`, `pitch_1s`）**：将 `dForces_dCond` 扩展为 $7\times 7$，支持斜入流过渡走廊三自由度力矩配平（$T = T_{\text{req}}, M_x = 0, M_y = 0$）。
+6. **叶根挥舞弯矩与推进效率指标**：`BEMTSymbolicOutput` 新增 `.root_flap_bending_moment`、`.propulsive_efficiency`、`.ct`/`.cp`/`.cq` 及一键约束构造器 `adapter.add_planform_constraints(...)`。
+
+* **5 截面 CST 倾转旋翼桨叶耦合优化实测案例**（$R=2.1\text{ m}, B=3, R_{\text{hub}}=0.21\text{ m}$，5 截面 $r/R=[0.1, 0.2, 0.5, 0.75, 1.0]$ 厚度约束 $\ge [0.28, 0.26, 0.18, 0.12, 0.08]$，$c_{\text{root}}=0.318\text{ m}, c_{\text{tip}}\ge 0.15\text{ m}$，0 km 悬停 $\Omega=110\text{ rad/s}, T\ge 15000\text{ N}$ 与 4.5 km 巡航 $\Omega=95.7\text{ rad/s}, T\ge 850\text{ N}, P\le 110\text{ kW}$）：99 维耦合设计变量仅耗时 **2.08 s** 即收敛，悬停功率降至 **314.74 kW**，巡航功率 **93.82 kW** 满足全部气动与几何厚度约束。
+
+---
+
+### 12. CPU 高性能神经网络代理引擎 (`fastopt.nn` / 融合 C++ `MLPNode` & `float32` 混合精度)
+
+针对接入大型神经网络代理模型（如气动/结构代理、PINN、NeuralFoil 等）在纯 CPU 环境下的高频求值与二阶优化需求，`fastopt` 提供了原生 C++17 融合算子 `OpType.MLP`（`MLPNode` / `CompiledMLP`）与 Python 接口模块 **`fastopt.nn`**，核心特性包括：
+
+1. **单节点融合 C++ 内核与零堆内存分配**：整张多层网络（前馈 MLP、残差网络 **ResNet**、**LayerNorm**、输入/输出仿射归一化）编译为计算图中的单个 `MLPNode`，彻底消除逐层节点调度与临时对象分配，内部按 OpenMP 线程预分配 Scratchpad 缓冲，完全线程安全。
+2. **`float32` / `float64` 混合精度引擎与可选 BLAS/MKL 加速**：通过 `use_float32=True` 在节点内部启用单精度 AVX2+FMA 向量化 GEMM（单周期吞吐翻倍、缓存带宽减半），边界自动与 `fastopt` 的 `float64` 优化器无缝衔接；同时 `CMakeLists.txt` 提供 `FASTOPT_ENABLE_BLAS`（默认 `ON`），若本机安装了 **Intel MKL** 或 **OpenBLAS** 将自动链接（`EIGEN_USE_MKL_ALL` / `EIGEN_USE_BLAS`），离线无 BLAS 环境则优雅回退至头文件 Eigen AVX2+FMA 内核。
+3. **全解析 0/1/2 阶自动微分与列向块稀疏性**：支持 13 种常用激活函数（`Identity`, `Tanh`, `SiLU`/`Swish`, `GELU`, `ReLU`, `Softplus`, `ELU`, `Sin`, `Sigmoid`, `LeakyReLU`, `Mish`, `SELU`, `HardSwish`）以及 `LayerNorm`、残差跳跃连接的精确 0 阶、1 阶（VJP + JVP）与 2 阶（Forward-over-Reverse HVP）解析导数；对多列批量符号输入 `(d_in, B)` 自动保持列间块对角稀疏性，且同一网络在计算图多处调用时零拷贝共享权重。
+
+#### 12.1 `fastopt.nn` 接口速查
+
+| 类与方法签名 | 说明 |
+| :--- | :--- |
+| `fo.nn.MLP(layers, *, use_float32=False, in_mean=None, in_std=None, out_mean=None, out_std=None, name="mlp")` | 从 `LayerConfig` 列表构建融合 C++ MLP，同时支持符号调用 `net(x_expr)` 与零 GIL 数值批量调用 `net(X_np)` |
+| `fo.nn.MLP.from_weights(weights, biases, activations="tanh", *, output_activation="identity", residual=False, layer_norm=False, use_float32=False, ...)` | 直接从权重矩阵列表 `[W_0, ...]` 与偏置列表 `[b_0, ...]` 构造融合 MLP |
+| `fo.nn.ResNetMLP(weights, biases, *, activation="silu", layer_norm=True, use_float32=False, ...)` | 残差 MLP 便捷构造器，自动为所有方阵隐藏层开启残差跳跃连接与 LayerNorm |
+| `net.save_npz(path)` / `fo.nn.MLP.from_npz(path, use_float32=None)` | 权重、激活函数、LayerNorm 参数及归一化统计量的 `.npz` 持久化与加载 |
+| `fo.nn.MLP.from_pytorch(module, *, use_float32=False, ...)` | 直接将 PyTorch `nn.Sequential` / `nn.Module`（`Linear` + `LayerNorm` + 激活层）零开销编译为 C++ `MLP` |
+| `fo.nn.NeuralFoilSurrogate.from_npz(npz_path, *, activation="silu", use_float32=False)` | 直接加载 NeuralFoil `.npz` 权重文件（`net.<k>.weight/bias`）为 C++ 融合 `MLPNode`，支持精确 1/2 阶 AD |
+| `fo.nn.Conv1D(W, b, *, stride=1, padding=0, dilation=1, activation="identity", use_float32=False)` | 原生 C++17 `im2col + BLAS3 GEMM` 一维卷积算子（`OpType.Conv1D`），精确 0/1/2 阶 AD 与带状局部感受野稀疏性 |
+| `fo.nn.MultiHeadAttention(Wq, bq, Wk, bk, Wv, bv, Wo, bo, *, num_heads=1, causal=False, residual=False, use_float32=False)` | 原生 C++17 多头自注意力算子（`OpType.Attention`），支持因果掩码与精确 2 阶 Softmax HVP |
+| `fo.nn.TransformerBlock(attn, ffn)` / `fo.nn.Sequential(*modules)` | 完整 Transformer 块（残差多头注意力 + LayerNorm FFN）与任意神经网络模块顺序拼接 |
+| `fo.nn.Conv2D(W, b, *, stride=1, padding=0, dilation=1, activation="identity", input_hw=None, use_float32=False)` | 原生 C++17 `im2col + BLAS3 GEMM` 二维卷积算子（`OpType.Conv2D`），支持 `(C, H*W)` 符号输入与 `(C, H, W)` 数值输入，精确 0/1/2 阶 AD 与二维局部感受野稀疏性 |
+| `fo.nn.AvgPool2D(kernel_size=2, *, stride=None, padding=0, input_hw=None)` / `fo.nn.MaxPool2D(...)` / `fo.nn.GlobalAvgPool2D()` | 原生 C++17 二维平均池化、最大池化与全局平均池化（`OpType.Pool2D`），精确 0/1/2 阶 AD 与二维局部稀疏性 |
+| `fo.nn.BatchNorm(running_mean, running_var, gamma=None, beta=None, *, eps=1e-5)` | 推理期通道仿射归一化，精确 0/1/2 阶 AD；提供 `.fold_into_conv_weights(W, b)` 将 BN 零开销代数折叠进前序卷积/线性层 |
+| `fo.nn.RMSNorm(gamma=None, *, eps=1e-6)` | 原生 C++17 均方根归一化算子（`OpType.RMSNorm`），精确 0/1/2 阶 Forward-over-Reverse HVP |
+| `fo.nn.from_onnx(path, *, use_float32=False, fuse_mlp=True)` | 零外部依赖纯 Python `.onnx` 解析器与编译器：自动融合连续线性+激活+残差为 C++ `MLPNode`、将 1D/2D `Conv` 降级为 `Conv1D`/`Conv2D` 并**自动将紧随的 `BatchNormalization` 折叠进卷积权重**，支持 `AveragePool`/`MaxPool`/`GlobalAveragePool`/`RMSNormalization` 及全部 13 种激活函数（2D 符号调用支持 `spatial_hw=(H, W)` 自动维度传播） |
+
+---
+
+### 13. 传统与梯度增强代理模型引擎 (`fastopt.surrogate` / 原生 C++17 `SurrogateNode`)
+
+针对小样本高精度气动/结构代理建模与主动加点优化（EGO / 贝叶斯优化），`fastopt` 提供了基于融合 C++17 算子 `OpType.Surrogate`（`SurrogateNode` / `CompiledSurrogate`）的传统与梯度增强代理模型库 **`fastopt.surrogate`**。所有模型均支持**预测均值 $\hat{y}(x)$ 与预测方差 $\sigma^2(x)$ 的精确 0/1/2 阶自动微分（梯度 + 海森 HVP）**，方差项内部采用 Cholesky 三角求解避免病态矩阵求逆抵消。
+
+#### 13.1 `fastopt.surrogate` 接口速查
+
+| 类与函数签名 | 说明 |
+| :--- | :--- |
+| `fo.surrogate.RBF(X_train, Y_train, *, kernel="multiquadric", length_scale=1.0, poly="linear", reg=1e-10)` | 径向基函数代理模型，支持 `gaussian`、`multiquadric`、`inv_multiquadric`、`cubic`、`tps` 五种核函数与常数/线性/二次多项式尾部，支持多输出与精确 0/1/2 阶 AD |
+| `fo.surrogate.Kriging(X_train, Y_train, *, kernel="matern52", poly="constant", nugget=1e-8, optimize_theta=True)` | 普通/泛克里金（Ordinary / Universal Kriging），支持各向异性 ARD 最大似然自动调参（`gaussian` / `matern32` / `matern52`），同时提供可微均值 `model(x)` 与可微方差 `model.variance(x)` / `model.std(x)` |
+| `fo.surrogate.GEK(X_train, Y_train, dY_train, *, kernel="gaussian", poly="constant", nugget=1e-8)` | 直接梯度增强克里金（Gradient-Enhanced Kriging），融合伴随 CFD 或 `fast_bemt` 解析梯度，小样本精度可较纯数值克里金提升一个数量级以上，均值与方差均支持精确 0/1/2 阶 AD |
+| `fo.surrogate.KPLS(X_train, Y_train, *, n_comp=2, ...)` / `fo.surrogate.GEKPLS(X_train, Y_train, dY_train, *, n_comp=2, ...)` | 高维偏最小二乘克里金与梯度增强 KPLS，将超参数维度从 $d$ 压缩至 $h = \text{n\_comp}$ 个主方向，适用于翼型 CST + 展向平面形状等高维代理建模 |
+| `fo.surrogate.CoKriging(X_lf, Y_lf, X_hf, Y_hf, *, dY_lf=None, dY_hf=None, kernel="matern52", poly="constant")` | 自回归多保真度克里金（$y_{\text{HF}} = \rho y_{\text{LF}} + \delta$），支持融合大量低保真样本（如 `fast_bemt`）与少量高保真样本（如 CFD），并可选开启低/高保真梯度增强（GE-CoKriging） |
+| `fo.surrogate.lower_confidence_bound(model, x, *, kappa=2.0)` / `fo.surrogate.expected_improvement(model, x, y_best, *, xi=0.0)` | $C^\infty$ 平滑可微采集函数（LCB / EI），可直接传入 `fo.Opti` 使用精确二阶海森执行梯度加点优化 |

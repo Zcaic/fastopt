@@ -120,6 +120,7 @@ int create_c_abi_blackbox_node(
 } // namespace
 
 NB_MODULE(_fastopt_impl, m) {
+    nb::set_leak_warnings(false);
     m.doc() = "C++17 Tensor-Level Automatic Differentiation and Optimization Core (fastopt)";
 
     // 1. Shape metadata binding
@@ -186,7 +187,14 @@ NB_MODULE(_fastopt_impl, m) {
         .value("ImplicitSolver", OpType::ImplicitSolver)
         .value("BlackBox", OpType::BlackBox)
         .value("Map", OpType::Map)
-        .value("Scan", OpType::Scan);
+        .value("Scan", OpType::Scan)
+        .value("MLP", OpType::MLP)
+        .value("Conv1D", OpType::Conv1D)
+        .value("Attention", OpType::Attention)
+        .value("Conv2D", OpType::Conv2D)
+        .value("Pool2D", OpType::Pool2D)
+        .value("RMSNorm", OpType::RMSNorm)
+        .value("Surrogate", OpType::Surrogate);
 
     // 3. Computation Graph container binding
     nb::class_<Graph>(m, "Graph")
@@ -400,6 +408,178 @@ NB_MODULE(_fastopt_impl, m) {
           "inner_seq_ids"_a, "seq_axes"_a, "inner_shared_ids"_a,
           "next_carry_out_id"_a, "step_y_out_id"_a, "num_steps"_a,
           "name"_a = "");
+
+    // Fused CPU Neural Network Surrogate bindings (MLP / ResNet / LayerNorm, fp32/fp64)
+    nb::enum_<NNActivation>(m, "NNActivation")
+        .value("Identity", NNActivation::Identity)
+        .value("Tanh", NNActivation::Tanh)
+        .value("SiLU", NNActivation::SiLU)
+        .value("GELU", NNActivation::GELU)
+        .value("ReLU", NNActivation::ReLU)
+        .value("Softplus", NNActivation::Softplus)
+        .value("ELU", NNActivation::ELU)
+        .value("Sin", NNActivation::Sin)
+        .value("Sigmoid", NNActivation::Sigmoid)
+        .value("LeakyReLU", NNActivation::LeakyReLU)
+        .value("Mish", NNActivation::Mish)
+        .value("SELU", NNActivation::SELU)
+        .value("HardSwish", NNActivation::HardSwish);
+
+    nb::class_<MLPLayerSpec>(m, "MLPLayerSpec")
+        .def(nb::init<>())
+        .def_rw("W", &MLPLayerSpec::W)
+        .def_rw("b", &MLPLayerSpec::b)
+        .def_rw("activation", &MLPLayerSpec::activation)
+        .def_rw("residual", &MLPLayerSpec::residual)
+        .def_rw("layer_norm", &MLPLayerSpec::layer_norm)
+        .def_rw("ln_gamma", &MLPLayerSpec::ln_gamma)
+        .def_rw("ln_beta", &MLPLayerSpec::ln_beta)
+        .def_rw("ln_eps", &MLPLayerSpec::ln_eps);
+
+    nb::class_<CompiledMLP>(m, "CompiledMLP")
+        .def(nb::init<const std::vector<MLPLayerSpec>&, bool,
+                      const Eigen::VectorXd&, const Eigen::VectorXd&,
+                      const Eigen::VectorXd&, const Eigen::VectorXd&,
+                      std::string>(),
+             "layers"_a, "use_float32"_a = false,
+             "in_mean"_a = Eigen::VectorXd(), "in_inv_std"_a = Eigen::VectorXd(),
+             "out_mean"_a = Eigen::VectorXd(), "out_std"_a = Eigen::VectorXd(),
+             "name"_a = "")
+        .def("d_in", &CompiledMLP::d_in)
+        .def("d_out", &CompiledMLP::d_out)
+        .def("num_layers", &CompiledMLP::num_layers)
+        .def("use_float32", &CompiledMLP::use_float32)
+        .def("eval", &CompiledMLP::eval, "X"_a, "num_threads"_a = 0,
+             nb::call_guard<nb::gil_scoped_release>());
+
+    m.def("op_mlp",
+          [](Graph& g, int x_id, const CompiledMLP& model, const std::string& name) {
+              return ops::mlp(g, x_id, model.data, name.empty() ? model.name : name);
+          },
+          "graph"_a, "x_id"_a, "model"_a, "name"_a = "");
+
+    nb::class_<CompiledConv1D>(m, "CompiledConv1D")
+        .def(nb::init<const Eigen::MatrixXd&, const Eigen::VectorXd&,
+                      int, int, int, int, int, NNActivation, bool, std::string>(),
+             "W"_a, "b"_a, "c_in"_a, "kernel_size"_a,
+             "stride"_a = 1, "padding"_a = 0, "dilation"_a = 1,
+             "activation"_a = NNActivation::Identity,
+             "use_float32"_a = false, "name"_a = "")
+        .def("c_in", &CompiledConv1D::c_in)
+        .def("c_out", &CompiledConv1D::c_out)
+        .def("kernel_size", &CompiledConv1D::kernel_size)
+        .def("stride", &CompiledConv1D::stride)
+        .def("padding", &CompiledConv1D::padding)
+        .def("dilation", &CompiledConv1D::dilation)
+        .def("use_float32", &CompiledConv1D::use_float32)
+        .def("eval", &CompiledConv1D::eval, "X"_a, nb::call_guard<nb::gil_scoped_release>());
+
+    m.def("op_conv1d",
+          [](Graph& g, int x_id, const CompiledConv1D& model, const std::string& name) {
+              return ops::conv1d(g, x_id, model.data, name.empty() ? model.name : name);
+          },
+          "graph"_a, "x_id"_a, "model"_a, "name"_a = "");
+
+    nb::class_<CompiledAttention>(m, "CompiledAttention")
+        .def(nb::init<const Eigen::MatrixXd&, const Eigen::VectorXd&,
+                      const Eigen::MatrixXd&, const Eigen::VectorXd&,
+                      const Eigen::MatrixXd&, const Eigen::VectorXd&,
+                      const Eigen::MatrixXd&, const Eigen::VectorXd&,
+                      int, bool, bool, bool, std::string>(),
+             "Wq"_a, "bq"_a, "Wk"_a, "bk"_a, "Wv"_a, "bv"_a, "Wo"_a, "bo"_a,
+             "num_heads"_a = 1, "causal"_a = false, "residual"_a = false,
+             "use_float32"_a = false, "name"_a = "")
+        .def("d_model", &CompiledAttention::d_model)
+        .def("num_heads", &CompiledAttention::num_heads)
+        .def("causal", &CompiledAttention::causal)
+        .def("residual", &CompiledAttention::residual)
+        .def("use_float32", &CompiledAttention::use_float32)
+        .def("eval", &CompiledAttention::eval, "X"_a, nb::call_guard<nb::gil_scoped_release>());
+
+    m.def("op_attention",
+          [](Graph& g, int x_id, const CompiledAttention& model, const std::string& name) {
+              return ops::attention(g, x_id, model.data, name.empty() ? model.name : name);
+          },
+          "graph"_a, "x_id"_a, "model"_a, "name"_a = "");
+
+    nb::class_<CompiledConv2D>(m, "CompiledConv2D")
+        .def(nb::init<const Eigen::MatrixXd&, const Eigen::VectorXd&,
+                      int, int, int, int, int, int, int, int, int,
+                      NNActivation, bool, std::string>(),
+             "W"_a, "b"_a, "c_in"_a, "kh"_a, "kw"_a,
+             "sh"_a = 1, "sw"_a = 1, "ph"_a = 0, "pw"_a = 0, "dh"_a = 1, "dw"_a = 1,
+             "activation"_a = NNActivation::Identity,
+             "use_float32"_a = false, "name"_a = "")
+        .def("c_in", &CompiledConv2D::c_in)
+        .def("c_out", &CompiledConv2D::c_out)
+        .def("out_hw", &CompiledConv2D::out_hw, "h_in"_a, "w_in"_a)
+        .def("eval", &CompiledConv2D::eval, "X"_a, "h_in"_a, "w_in"_a, nb::call_guard<nb::gil_scoped_release>());
+
+    m.def("op_conv2d",
+          [](Graph& g, int x_id, int h_in, int w_in, const CompiledConv2D& model, const std::string& name) {
+              return ops::conv2d(g, x_id, h_in, w_in, model.data, name.empty() ? model.name : name);
+          },
+          "graph"_a, "x_id"_a, "h_in"_a, "w_in"_a, "model"_a, "name"_a = "");
+
+    nb::enum_<Pool2DMode>(m, "Pool2DMode")
+        .value("Avg", Pool2DMode::Avg)
+        .value("Max", Pool2DMode::Max);
+
+    m.def("op_pool2d", &ops::pool2d,
+          "graph"_a, "x_id"_a, "mode"_a, "h_in"_a, "w_in"_a,
+          "kh"_a, "kw"_a, "sh"_a = 2, "sw"_a = 2, "ph"_a = 0, "pw"_a = 0, "name"_a = "");
+
+    m.def("op_rms_norm", &ops::rms_norm,
+          "graph"_a, "x_id"_a, "gamma"_a = Eigen::VectorXd(), "eps"_a = 1e-6, "name"_a = "");
+
+    nb::enum_<SurrogateKernel>(m, "SurrogateKernel")
+        .value("Gaussian", SurrogateKernel::Gaussian)
+        .value("Multiquadric", SurrogateKernel::Multiquadric)
+        .value("InvMultiquadric", SurrogateKernel::InvMultiquadric)
+        .value("Cubic", SurrogateKernel::Cubic)
+        .value("ThinPlateSpline", SurrogateKernel::ThinPlateSpline)
+        .value("Matern32", SurrogateKernel::Matern32)
+        .value("Matern52", SurrogateKernel::Matern52);
+
+    nb::enum_<SurrogateOutputMode>(m, "SurrogateOutputMode")
+        .value("Mean", SurrogateOutputMode::Mean)
+        .value("Variance", SurrogateOutputMode::Variance);
+
+    nb::class_<CompiledSurrogate>(m, "CompiledSurrogate")
+        .def(nb::init<SurrogateKernel, int,
+                      const Eigen::MatrixXd&, const Eigen::VectorXd&,
+                      const Eigen::MatrixXd&, const Eigen::MatrixXd&,
+                      const Eigen::MatrixXd&,
+                      const Eigen::VectorXd&, const Eigen::VectorXd&,
+                      const Eigen::VectorXd&, const Eigen::VectorXd&,
+                      const Eigen::VectorXd&,
+                      const Eigen::MatrixXd&, const Eigen::MatrixXd&, const Eigen::MatrixXd&,
+                      double, std::string>(),
+             "kernel"_a, "poly_degree"_a, "X_centers"_a, "theta"_a, "alpha"_a,
+             "beta_grad"_a = Eigen::MatrixXd(), "poly_coef"_a = Eigen::MatrixXd(),
+             "in_mean"_a = Eigen::VectorXd(), "in_inv_std"_a = Eigen::VectorXd(),
+             "out_mean"_a = Eigen::VectorXd(), "out_std"_a = Eigen::VectorXd(),
+             "sigma2"_a = Eigen::VectorXd(),
+             "M_kk"_a = Eigen::MatrixXd(), "M_kp"_a = Eigen::MatrixXd(), "M_pp"_a = Eigen::MatrixXd(),
+             "r_eps"_a = 1e-14, "name"_a = "")
+        .def("d_in", &CompiledSurrogate::d_in)
+        .def("d_out", &CompiledSurrogate::d_out)
+        .def("n_centers", &CompiledSurrogate::n_centers)
+        .def("has_grad_basis", &CompiledSurrogate::has_grad_basis)
+        .def("has_variance", &CompiledSurrogate::has_variance)
+        .def("eval", &CompiledSurrogate::eval, "X"_a, "num_threads"_a = 0,
+             nb::call_guard<nb::gil_scoped_release>())
+        .def("eval_variance", &CompiledSurrogate::eval_variance, "X"_a, "num_threads"_a = 0,
+             nb::call_guard<nb::gil_scoped_release>());
+
+    m.def("op_surrogate",
+          [](Graph& g, int x_id, const CompiledSurrogate& model,
+             SurrogateOutputMode mode, const std::string& name) {
+              return ops::surrogate(g, x_id, model.data, mode, name.empty() ? model.name : name);
+          },
+          "graph"_a, "x_id"_a, "model"_a,
+          "mode"_a = SurrogateOutputMode::Mean, "name"_a = "");
+
 
     // 5. High-performance Evaluator with GIL release on compute-intensive methods
     nb::class_<Evaluator>(m, "Evaluator")

@@ -12,7 +12,7 @@ All comments are written in English.
 
 import time
 import numpy as np
-import python.fastopt as fo
+import fastopt as fo
 
 
 # ============================================================================

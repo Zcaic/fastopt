@@ -2734,9 +2734,17 @@ class GraphBuilder:
         nid = self._graph.add_variable(s, init_flat, lb_flat, ub_flat, name)
         return Expr(self._graph, nid)
 
-    def parameter(self, shape: ShapeLike = (1, 1), value: ArrayLike = 0.0, name: str = "") -> Expr:
-        """Alias for variable(..., init=value, freeze=True)."""
-        return self.variable(shape=shape, init=value, freeze=True, name=name)
+    def parameter(
+        self,
+        shape: ShapeLike = (1, 1),
+        value: ArrayLike = 0.0,
+        name: str = "",
+        *,
+        val: Optional[ArrayLike] = None,
+    ) -> Expr:
+        """Alias for variable(..., init=value, freeze=True). Accepts either `value=` or `val=`."""
+        init_val = value if val is None else val
+        return self.variable(shape=shape, init=init_val, freeze=True, name=name)
 
     def constant(self, value: ArrayLike, shape: Optional[ShapeLike] = None, name: str = "") -> Expr:
         """Create an immutable ConstantNode in the computation graph."""
@@ -3264,7 +3272,7 @@ def help_api(target: Optional[Any] = None, print_output: bool = True) -> str:
                 "implicit_solve", "vmap", "scan", "where", "smooth_where", "cond"
             ]),
             ("5. Black-Box Operators (Python `@blackbox` & Zero-GIL C-ABI `CBlackBox`)", [
-                "CustomOp", "blackbox", "CBlackBox", "c_blackbox"
+                "CustomOp", "blackbox", "CBlackBox", "c_blackbox", "FastBEMTAdapter", "BEMTSymbolicOutput"
             ]),
             ("6. Smooth Aggregations, Tensor Indexing & Math Operators", [
                 "ks_max", "ks_min", "logsumexp", "smooth_abs", "smooth_max", "smooth_min", "smooth_clip",

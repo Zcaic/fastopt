@@ -90,6 +90,13 @@ class OpType(Enum):
     BlackBox = ...
     Map = ...
     Scan = ...
+    MLP = ...
+    Conv1D = ...
+    Attention = ...
+    Conv2D = ...
+    Pool2D = ...
+    RMSNorm = ...
+    Surrogate = ...
 
 class Graph:
     """C++17 dynamic tensor computation graph container with 3-segment contiguous memory layout."""
@@ -663,5 +670,200 @@ def op_scan_subgraph(
     next_carry_out_id: int,
     step_y_out_id: int,
     num_steps: int,
+    name: str = "",
+) -> int: ...
+
+
+class NNActivation(Enum):
+    Identity: NNActivation
+    Tanh: NNActivation
+    SiLU: NNActivation
+    GELU: NNActivation
+    ReLU: NNActivation
+    Softplus: NNActivation
+    ELU: NNActivation
+    Sin: NNActivation
+    Sigmoid: NNActivation
+    LeakyReLU: NNActivation
+    Mish: NNActivation
+    SELU: NNActivation
+    HardSwish: NNActivation
+
+class MLPLayerSpec:
+    W: NDArray[np.float64]
+    b: NDArray[np.float64]
+    activation: NNActivation
+    residual: bool
+    layer_norm: bool
+    ln_gamma: NDArray[np.float64]
+    ln_beta: NDArray[np.float64]
+    ln_eps: float
+    def __init__(self) -> None: ...
+
+class CompiledMLP:
+    def __init__(
+        self,
+        layers: Sequence[MLPLayerSpec],
+        use_float32: bool = False,
+        in_mean: NDArray[np.float64] = ...,
+        in_inv_std: NDArray[np.float64] = ...,
+        out_mean: NDArray[np.float64] = ...,
+        out_std: NDArray[np.float64] = ...,
+        name: str = "",
+    ) -> None: ...
+    def d_in(self) -> int: ...
+    def d_out(self) -> int: ...
+    def num_layers(self) -> int: ...
+    def use_float32(self) -> bool: ...
+    def eval(self, X: NDArray[np.float64], num_threads: int = 0) -> NDArray[np.float64]: ...
+
+def op_mlp(graph: Graph, x_id: int, model: CompiledMLP, name: str = "") -> int: ...
+
+class CompiledConv1D:
+    def __init__(
+        self,
+        W: NDArray[np.float64],
+        b: NDArray[np.float64],
+        c_in: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        dilation: int = 1,
+        activation: NNActivation = ...,
+        use_float32: bool = False,
+        name: str = "",
+    ) -> None: ...
+    def c_in(self) -> int: ...
+    def c_out(self) -> int: ...
+    def kernel_size(self) -> int: ...
+    def stride(self) -> int: ...
+    def padding(self) -> int: ...
+    def dilation(self) -> int: ...
+    def use_float32(self) -> bool: ...
+    def eval(self, X: NDArray[np.float64]) -> NDArray[np.float64]: ...
+
+def op_conv1d(graph: Graph, x_id: int, model: CompiledConv1D, name: str = "") -> int: ...
+
+class CompiledAttention:
+    def __init__(
+        self,
+        Wq: NDArray[np.float64], bq: NDArray[np.float64],
+        Wk: NDArray[np.float64], bk: NDArray[np.float64],
+        Wv: NDArray[np.float64], bv: NDArray[np.float64],
+        Wo: NDArray[np.float64], bo: NDArray[np.float64],
+        num_heads: int = 1,
+        causal: bool = False,
+        residual: bool = False,
+        use_float32: bool = False,
+        name: str = "",
+    ) -> None: ...
+    def d_model(self) -> int: ...
+    def num_heads(self) -> int: ...
+    def causal(self) -> bool: ...
+    def residual(self) -> bool: ...
+    def use_float32(self) -> bool: ...
+    def eval(self, X: NDArray[np.float64]) -> NDArray[np.float64]: ...
+
+def op_attention(graph: Graph, x_id: int, model: CompiledAttention, name: str = "") -> int: ...
+
+class CompiledConv2D:
+    def __init__(
+        self,
+        W: NDArray[np.float64],
+        b: NDArray[np.float64],
+        c_in: int,
+        kh: int,
+        kw: int,
+        sh: int = 1,
+        sw: int = 1,
+        ph: int = 0,
+        pw: int = 0,
+        dh: int = 1,
+        dw: int = 1,
+        activation: NNActivation = ...,
+        use_float32: bool = False,
+        name: str = "",
+    ) -> None: ...
+    def c_in(self) -> int: ...
+    def c_out(self) -> int: ...
+    def out_hw(self, h_in: int, w_in: int) -> Tuple[int, int]: ...
+    def eval(self, X: NDArray[np.float64], h_in: int, w_in: int) -> NDArray[np.float64]: ...
+
+def op_conv2d(graph: Graph, x_id: int, h_in: int, w_in: int, model: CompiledConv2D, name: str = "") -> int: ...
+
+class Pool2DMode(Enum):
+    Avg: Pool2DMode
+    Max: Pool2DMode
+
+def op_pool2d(
+    graph: Graph,
+    x_id: int,
+    mode: Pool2DMode,
+    h_in: int,
+    w_in: int,
+    kh: int,
+    kw: int,
+    sh: int = 2,
+    sw: int = 2,
+    ph: int = 0,
+    pw: int = 0,
+    name: str = "",
+) -> int: ...
+
+def op_rms_norm(
+    graph: Graph,
+    x_id: int,
+    gamma: NDArray[np.float64] = ...,
+    eps: float = 1e-6,
+    name: str = "",
+) -> int: ...
+
+class SurrogateKernel(Enum):
+    Gaussian: SurrogateKernel
+    Multiquadric: SurrogateKernel
+    InvMultiquadric: SurrogateKernel
+    Cubic: SurrogateKernel
+    ThinPlateSpline: SurrogateKernel
+    Matern32: SurrogateKernel
+    Matern52: SurrogateKernel
+
+class SurrogateOutputMode(Enum):
+    Mean: SurrogateOutputMode
+    Variance: SurrogateOutputMode
+
+class CompiledSurrogate:
+    def __init__(
+        self,
+        kernel: SurrogateKernel,
+        poly_degree: int,
+        X_centers: NDArray[np.float64],
+        theta: NDArray[np.float64],
+        alpha: NDArray[np.float64],
+        beta_grad: NDArray[np.float64] = ...,
+        poly_coef: NDArray[np.float64] = ...,
+        in_mean: NDArray[np.float64] = ...,
+        in_inv_std: NDArray[np.float64] = ...,
+        out_mean: NDArray[np.float64] = ...,
+        out_std: NDArray[np.float64] = ...,
+        sigma2: NDArray[np.float64] = ...,
+        M_kk: NDArray[np.float64] = ...,
+        M_kp: NDArray[np.float64] = ...,
+        M_pp: NDArray[np.float64] = ...,
+        r_eps: float = 1e-14,
+        name: str = "",
+    ) -> None: ...
+    def d_in(self) -> int: ...
+    def d_out(self) -> int: ...
+    def n_centers(self) -> int: ...
+    def has_grad_basis(self) -> bool: ...
+    def has_variance(self) -> bool: ...
+    def eval(self, X: NDArray[np.float64], num_threads: int = 0) -> NDArray[np.float64]: ...
+    def eval_variance(self, X: NDArray[np.float64], num_threads: int = 0) -> NDArray[np.float64]: ...
+
+def op_surrogate(
+    graph: Graph,
+    x_id: int,
+    model: CompiledSurrogate,
+    mode: SurrogateOutputMode = ...,
     name: str = "",
 ) -> int: ...

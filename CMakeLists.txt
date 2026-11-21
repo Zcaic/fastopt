@@ -38,6 +38,8 @@ endif()
 # 3. Hardware Acceleration (SIMD: AVX2 + FMA) and OpenMP Multi-Threading
 # ==============================================================================
 option(FASTOPT_ENABLE_SIMD "Enable AVX2 and FMA vectorization instructions" ON)
+option(FASTOPT_ENABLE_BLAS "Enable optional Intel MKL or OpenBLAS acceleration for Eigen GEMM" ON)
+option(FASTOPT_BLAS_STATIC "Prefer static OpenBLAS linking (libopenblas.a) on MinGW for a self-contained .pyd" ON)
 
 add_library(fastopt_compiler_flags INTERFACE)
 
@@ -56,7 +58,7 @@ elseif(MINGW)
     if(FASTOPT_ENABLE_SIMD)
         target_compile_options(fastopt_compiler_flags INTERFACE -march=native -mavx2 -mfma)
     endif()
-    target_link_options(fastopt_compiler_flags INTERFACE -static-libgcc -static-libstdc++)
+    target_link_options(fastopt_compiler_flags INTERFACE -static-libgcc -static-libstdc++ -Wl,--exclude-libs,ALL)
     target_link_libraries(fastopt_compiler_flags INTERFACE
         "-Wl,-Bstatic" stdc++ gomp winpthread gcc_eh gcc "-Wl,-Bdynamic"
     )
@@ -117,6 +119,65 @@ if(FASTOPT_CASADI_DIR_CMAKE)
         target_compile_definitions(fastopt_core PUBLIC FASTOPT_HAS_IPOPT_HEADER=1)
     endif()
 endif()
+# Optional external BLAS (Intel MKL / OpenBLAS) for large neural network GEMM acceleration.
+# Gracefully falls back to header-only Eigen AVX2+FMA GEMM if no BLAS library is installed.
+if(FASTOPT_ENABLE_BLAS)
+    find_package(MKL CONFIG QUIET)
+    if(MKL_FOUND)
+        message(STATUS "fastopt: Enabling Intel MKL acceleration (EIGEN_USE_MKL_ALL)")
+        target_compile_definitions(fastopt_core PUBLIC EIGEN_USE_MKL_ALL)
+        target_link_libraries(fastopt_core PUBLIC MKL::MKL)
+    else()
+        set(FASTOPT_BLAS_CONFIGURED OFF)
+        if(MINGW AND FASTOPT_BLAS_STATIC)
+            # Derive the active MSYS2/MinGW sysroot lib directory from CMAKE_CXX_COMPILER
+            # so VS Code / PowerShell CMake runs automatically locate ucrt64/lib/libopenblas.a.
+            get_filename_component(_FASTOPT_CXX_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+            get_filename_component(_FASTOPT_MINGW_ROOT "${_FASTOPT_CXX_BIN_DIR}" DIRECTORY)
+            set(_FASTOPT_MINGW_LIB_HINTS
+                "${_FASTOPT_MINGW_ROOT}/lib"
+                "$ENV{MINGW_PREFIX}/lib"
+                "C:/msys64/ucrt64/lib"
+                "D:/msys64/ucrt64/lib"
+            )
+            find_library(FASTOPT_OPENBLAS_STATIC_LIB
+                NAMES libopenblas.a
+                HINTS ${_FASTOPT_MINGW_LIB_HINTS}
+            )
+            if(FASTOPT_OPENBLAS_STATIC_LIB)
+                message(STATUS "fastopt: Enabling STATIC OpenBLAS acceleration (EIGEN_USE_BLAS): ${FASTOPT_OPENBLAS_STATIC_LIB}")
+                target_compile_definitions(fastopt_core PUBLIC EIGEN_USE_BLAS)
+                target_link_libraries(fastopt_core PUBLIC "${FASTOPT_OPENBLAS_STATIC_LIB}")
+                find_library(FASTOPT_GFORTRAN_STATIC_LIB
+                    NAMES libgfortran.a
+                    HINTS ${_FASTOPT_MINGW_LIB_HINTS}
+                )
+                find_library(FASTOPT_QUADMATH_STATIC_LIB
+                    NAMES libquadmath.a
+                    HINTS ${_FASTOPT_MINGW_LIB_HINTS}
+                )
+                if(FASTOPT_GFORTRAN_STATIC_LIB)
+                    target_link_libraries(fastopt_core PUBLIC "${FASTOPT_GFORTRAN_STATIC_LIB}")
+                endif()
+                if(FASTOPT_QUADMATH_STATIC_LIB)
+                    target_link_libraries(fastopt_core PUBLIC "${FASTOPT_QUADMATH_STATIC_LIB}")
+                endif()
+                set(FASTOPT_BLAS_CONFIGURED ON)
+            endif()
+        endif()
+        if(NOT FASTOPT_BLAS_CONFIGURED)
+            find_package(BLAS QUIET)
+            if(BLAS_FOUND)
+                message(STATUS "fastopt: Enabling external BLAS acceleration (EIGEN_USE_BLAS): ${BLAS_LIBRARIES}")
+                target_compile_definitions(fastopt_core PUBLIC EIGEN_USE_BLAS)
+                target_link_libraries(fastopt_core PUBLIC ${BLAS_LIBRARIES})
+            else()
+                message(STATUS "fastopt: No external BLAS/MKL found; using built-in Eigen AVX2+FMA GEMM.")
+            endif()
+        endif()
+    endif()
+endif()
+
 target_link_libraries(fastopt_core PUBLIC
     Eigen3::Eigen
     fastopt_compiler_flags

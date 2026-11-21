@@ -644,9 +644,7 @@ void propagate_graph_sparsity(
 
                     for (Eigen::Index idx = 0; idx < m_slice; ++idx) {
                         const Eigen::Index out_slot =
-                            (mn.out_axis == 0)
-                                ? (nd.offset + static_cast<Eigen::Index>(b) + idx * nd.shape.rows)
-                                : (nd.offset + idx + static_cast<Eigen::Index>(b) * nd.shape.rows);
+                            outer_slice_elem_offset(nd, mn.out_axis, b, sub_out.shape, idx);
                         std::uint64_t* dst = deps_of(out_slot);
                         const std::uint64_t* s_dep =
                             &sub_deps[static_cast<std::size_t>(sub_out.offset + idx) * n_sub_words];
@@ -829,6 +827,189 @@ void propagate_graph_sparsity(
                     or_bits(deps_of(nd.offset + idx),
                             &step_in_deps[static_cast<std::size_t>(inner_c.offset + idx) * n_words],
                             n_words);
+                }
+                break;
+            }
+            case OpType::Surrogate: {
+                const Node& xn = g.node(nd.inputs[0]);
+                const Eigen::Index d_in = xn.shape.rows;
+                const Eigen::Index d_out = nd.shape.rows;
+                const Eigen::Index B = nd.shape.cols;
+                std::vector<std::uint64_t> col_dep(n_words, 0ULL);
+                for (Eigen::Index b = 0; b < B; ++b) {
+                    std::fill(col_dep.begin(), col_dep.end(), 0ULL);
+                    const Eigen::Index in_base = xn.offset + b * d_in;
+                    for (Eigen::Index i = 0; i < d_in; ++i) {
+                        or_bits(col_dep.data(), deps_of(in_base + i), n_words);
+                    }
+                    const Eigen::Index out_base = nd.offset + b * d_out;
+                    for (Eigen::Index j = 0; j < d_out; ++j) {
+                        or_bits(deps_of(out_base + j), col_dep.data(), n_words);
+                    }
+                    if (compute_hessian) {
+                        add_clique(hess_bits, col_dep.data(), n_words);
+                    }
+                }
+                break;
+            }
+            case OpType::MLP: {
+                // Column-wise dense coupling: each batch column b couples only its own
+                // d_in input entries to its d_out output entries, preserving sparsity across B.
+                const auto& mn = static_cast<const MLPNode&>(nd);
+                const Node& xn = g.node(nd.inputs[0]);
+                const Eigen::Index d_in = mn.data->d_in;
+                const Eigen::Index d_out = mn.data->d_out;
+                const Eigen::Index B = mn.batch_cols;
+                std::vector<std::uint64_t> col_dep(n_words, 0ULL);
+                for (Eigen::Index b = 0; b < B; ++b) {
+                    std::fill(col_dep.begin(), col_dep.end(), 0ULL);
+                    const Eigen::Index in_base = xn.offset + b * d_in;
+                    for (Eigen::Index i = 0; i < d_in; ++i) {
+                        or_bits(col_dep.data(), deps_of(in_base + i), n_words);
+                    }
+                    const Eigen::Index out_base = nd.offset + b * d_out;
+                    for (Eigen::Index j = 0; j < d_out; ++j) {
+                        or_bits(deps_of(out_base + j), col_dep.data(), n_words);
+                    }
+                    if (compute_hessian) {
+                        add_clique(hess_bits, col_dep.data(), n_words);
+                    }
+                }
+                break;
+            }
+            case OpType::Conv1D: {
+                // Local receptive-field banded sparsity: each output position lo couples only
+                // to input positions li = lo*S - P + k*D (k = 0..K-1).
+                const auto& cn = static_cast<const Conv1DNode&>(nd);
+                const Node& xn = g.node(nd.inputs[0]);
+                const Eigen::Index c_in = cn.data->c_in;
+                const Eigen::Index c_out = cn.data->c_out;
+                const int K = cn.data->kernel_size;
+                const int S = cn.data->stride;
+                const int P = cn.data->padding;
+                const int D = cn.data->dilation;
+                std::vector<std::uint64_t> win_dep(n_words, 0ULL);
+                for (Eigen::Index lo = 0; lo < cn.l_out; ++lo) {
+                    std::fill(win_dep.begin(), win_dep.end(), 0ULL);
+                    const Eigen::Index base = lo * S - P;
+                    for (int k = 0; k < K; ++k) {
+                        const Eigen::Index li = base + static_cast<Eigen::Index>(k) * D;
+                        if (li >= 0 && li < cn.l_in) {
+                            const Eigen::Index in_base = xn.offset + li * c_in;
+                            for (Eigen::Index ci = 0; ci < c_in; ++ci) {
+                                or_bits(win_dep.data(), deps_of(in_base + ci), n_words);
+                            }
+                        }
+                    }
+                    const Eigen::Index out_base = nd.offset + lo * c_out;
+                    for (Eigen::Index co = 0; co < c_out; ++co) {
+                        or_bits(deps_of(out_base + co), win_dep.data(), n_words);
+                    }
+                    if (compute_hessian) {
+                        add_clique(hess_bits, win_dep.data(), n_words);
+                    }
+                }
+                break;
+            }
+            case OpType::Attention: {
+                // Causal attention couples query j only to tokens i <= j; full attention couples all tokens.
+                const auto& an = static_cast<const AttentionNode&>(nd);
+                const Node& xn = g.node(nd.inputs[0]);
+                const Eigen::Index dm = an.data->d_model;
+                const Eigen::Index L = an.seq_len;
+                std::vector<std::uint64_t> pref_dep(n_words, 0ULL);
+                if (an.data->causal) {
+                    for (Eigen::Index j = 0; j < L; ++j) {
+                        const Eigen::Index in_base = xn.offset + j * dm;
+                        for (Eigen::Index r = 0; r < dm; ++r) {
+                            or_bits(pref_dep.data(), deps_of(in_base + r), n_words);
+                        }
+                        const Eigen::Index out_base = nd.offset + j * dm;
+                        for (Eigen::Index r = 0; r < dm; ++r) {
+                            or_bits(deps_of(out_base + r), pref_dep.data(), n_words);
+                        }
+                        if (compute_hessian) {
+                            add_clique(hess_bits, pref_dep.data(), n_words);
+                        }
+                    }
+                } else {
+                    for (Eigen::Index idx = 0; idx < xn.size(); ++idx) {
+                        or_bits(pref_dep.data(), deps_of(xn.offset + idx), n_words);
+                    }
+                    for (Eigen::Index idx = 0; idx < nd.size(); ++idx) {
+                        or_bits(deps_of(nd.offset + idx), pref_dep.data(), n_words);
+                    }
+                    if (compute_hessian) {
+                        add_clique(hess_bits, pref_dep.data(), n_words);
+                    }
+                }
+                break;
+            }
+            case OpType::Conv2D: {
+                const auto& cn = static_cast<const Conv2DNode&>(nd);
+                const Node& xn = g.node(nd.inputs[0]);
+                const Eigen::Index c_in = cn.data->c_in;
+                const Eigen::Index c_out = cn.data->c_out;
+                std::vector<std::uint64_t> win_dep(n_words, 0ULL);
+                for (int ho = 0; ho < cn.h_out; ++ho) {
+                    for (int wo = 0; wo < cn.w_out; ++wo) {
+                        std::fill(win_dep.begin(), win_dep.end(), 0ULL);
+                        for (int r = 0; r < cn.data->kh; ++r) {
+                            const int hi = ho * cn.data->sh - cn.data->ph + r * cn.data->dh;
+                            if (hi < 0 || hi >= cn.h_in) continue;
+                            for (int c = 0; c < cn.data->kw; ++c) {
+                                const int wi = wo * cn.data->sw - cn.data->pw + c * cn.data->dw;
+                                if (wi < 0 || wi >= cn.w_in) continue;
+                                const Eigen::Index in_base = xn.offset + (static_cast<Eigen::Index>(hi) * cn.w_in + wi) * c_in;
+                                for (Eigen::Index ci = 0; ci < c_in; ++ci)
+                                    or_bits(win_dep.data(), deps_of(in_base + ci), n_words);
+                            }
+                        }
+                        const Eigen::Index out_base = nd.offset + (static_cast<Eigen::Index>(ho) * cn.w_out + wo) * c_out;
+                        for (Eigen::Index co = 0; co < c_out; ++co)
+                            or_bits(deps_of(out_base + co), win_dep.data(), n_words);
+                        if (compute_hessian) add_clique(hess_bits, win_dep.data(), n_words);
+                    }
+                }
+                break;
+            }
+            case OpType::Pool2D: {
+                const auto& pn = static_cast<const Pool2DNode&>(nd);
+                const Node& xn = g.node(nd.inputs[0]);
+                for (int ho = 0; ho < pn.h_out; ++ho) {
+                    for (int wo = 0; wo < pn.w_out; ++wo) {
+                        const Eigen::Index out_col = static_cast<Eigen::Index>(ho) * pn.w_out + wo;
+                        for (Eigen::Index ch = 0; ch < pn.channels; ++ch) {
+                            std::uint64_t* dst = deps_of(nd.offset + out_col * pn.channels + ch);
+                            for (int r = 0; r < pn.kh; ++r) {
+                                const int hi = ho * pn.sh - pn.ph + r;
+                                if (hi < 0 || hi >= pn.h_in) continue;
+                                for (int c = 0; c < pn.kw; ++c) {
+                                    const int wi = wo * pn.sw - pn.pw + c;
+                                    if (wi >= 0 && wi < pn.w_in) {
+                                        const Eigen::Index in_idx = xn.offset + (static_cast<Eigen::Index>(hi) * pn.w_in + wi) * pn.channels + ch;
+                                        or_bits(dst, deps_of(in_idx), n_words);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+            case OpType::RMSNorm: {
+                const auto& rn = static_cast<const RMSNormNode&>(nd);
+                const Node& xn = g.node(nd.inputs[0]);
+                std::vector<std::uint64_t> col_dep(n_words, 0ULL);
+                for (Eigen::Index b = 0; b < rn.cols; ++b) {
+                    std::fill(col_dep.begin(), col_dep.end(), 0ULL);
+                    const Eigen::Index in_base = xn.offset + b * rn.dim;
+                    for (Eigen::Index i = 0; i < rn.dim; ++i)
+                        or_bits(col_dep.data(), deps_of(in_base + i), n_words);
+                    const Eigen::Index out_base = nd.offset + b * rn.dim;
+                    for (Eigen::Index i = 0; i < rn.dim; ++i)
+                        or_bits(deps_of(out_base + i), col_dep.data(), n_words);
+                    if (compute_hessian) add_clique(hess_bits, col_dep.data(), n_words);
                 }
                 break;
             }
@@ -1105,8 +1286,36 @@ std::vector<Eigen::MatrixXd> Evaluator::eval(const Eigen::Ref<const Eigen::Vecto
 
 Eigen::MatrixXd Evaluator::eval_node(const Eigen::Ref<const Eigen::VectorXd>& x, int node_id) {
     ensure_forward_evaluated(x);
-    const Node& n = graph_->node(node_id);
-    return main_ws_.val_mat(n.offset, n.shape);
+    const Node& target = graph_->node(node_id);
+    if (target.op != OpType::Variable && target.op != OpType::Parameter &&
+        target.op != OpType::Constant && target.op != OpType::ImplicitState) {
+        const auto& exec_order = graph_->all_exec_order();
+        if (!std::binary_search(exec_order.begin(), exec_order.end(), node_id)) {
+            std::vector<char> need(static_cast<std::size_t>(node_id + 1), 0);
+            need[static_cast<std::size_t>(node_id)] = 1;
+            for (int i = node_id; i >= 0; --i) {
+                if (!need[static_cast<std::size_t>(i)]) continue;
+                const Node& nd = graph_->node(i);
+                if (nd.op == OpType::Variable || nd.op == OpType::Parameter ||
+                    nd.op == OpType::Constant || nd.op == OpType::ImplicitState ||
+                    std::binary_search(exec_order.begin(), exec_order.end(), i)) {
+                    need[static_cast<std::size_t>(i)] = 0;
+                    continue;
+                }
+                for (int pid : nd.inputs) {
+                    if (pid >= 0 && pid <= node_id) {
+                        need[static_cast<std::size_t>(pid)] = 1;
+                    }
+                }
+            }
+            for (int i = 0; i <= node_id; ++i) {
+                if (need[static_cast<std::size_t>(i)]) {
+                    graph_->node(i).forward(main_ws_);
+                }
+            }
+        }
+    }
+    return main_ws_.val_mat(target.offset, target.shape);
 }
 
 std::vector<Eigen::MatrixXd> Evaluator::eval_batch(
@@ -1201,6 +1410,7 @@ std::vector<Eigen::MatrixXd> Evaluator::eval_batch(
         }
     }
 
+    invalidate_forward_cache();
     return batch_outputs;
 }
 

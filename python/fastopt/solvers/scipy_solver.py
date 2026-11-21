@@ -126,12 +126,20 @@ def _recover_kkt_multipliers(
                 col_kinds.append(("ineq", i))
 
     for j in range(n):
-        if np.isfinite(lb[j]) and (x_opt[j] - lb[j]) <= active_tol:
+        tol_j = active_tol * max(1.0, abs(x_opt[j]))
+        lb_act = np.isfinite(lb[j]) and (x_opt[j] - lb[j]) <= tol_j
+        ub_act = np.isfinite(ub[j]) and (ub[j] - x_opt[j]) <= tol_j
+        if lb_act and ub_act:
+            e_j = np.zeros(n, dtype=np.float64)
+            e_j[j] = -1.0
+            cols.append(e_j)
+            col_kinds.append(("fixed", j))
+        elif lb_act:
             e_j = np.zeros(n, dtype=np.float64)
             e_j[j] = -1.0
             cols.append(e_j)
             col_kinds.append(("lb", j))
-        elif np.isfinite(ub[j]) and (ub[j] - x_opt[j]) <= active_tol:
+        elif ub_act:
             e_j = np.zeros(n, dtype=np.float64)
             e_j[j] = 1.0
             cols.append(e_j)
@@ -145,6 +153,11 @@ def _recover_kkt_multipliers(
                 mult_eq[idx] = float(val)
             elif kind == "ineq":
                 mult_ineq[idx] = max(0.0, float(val))
+            elif kind == "fixed":
+                if val >= 0.0:
+                    mult_x_L[idx] = float(val)
+                else:
+                    mult_x_U[idx] = float(-val)
             elif kind == "lb":
                 mult_x_L[idx] = max(0.0, float(val))
             elif kind == "ub":
@@ -414,6 +427,11 @@ def solve_scipy(
         "options": opts,
         "callback": scipy_cb,
     }
+    if (has_eq or has_ineq) and not constraints:
+        raise ValueError(
+            f"SciPy method '{method}' does not support equality/inequality constraints; "
+            "use 'SLSQP', 'trust-constr', or 'ipopt'."
+        )
     if constraints:
         minimize_kwargs["constraints"] = constraints
     if hess_arg is not None:

@@ -37,6 +37,7 @@ namespace {
 #ifndef FASTOPT_IPOPT_TYPES_DEFINED
 // Official COIN-OR IpStdCInterface C ABI types (Ipopt 3.x 64-bit, matches CasADi's bundled libipopt)
 using ipindex = int;
+using ipbool = int;
 using ipnumber = double;
 
 struct IpoptProblemInfo;
@@ -66,27 +67,29 @@ enum ApplicationReturnStatus {
     Internal_Error = -199
 };
 
-using Eval_F_CB = bool (*)(ipindex n, ipnumber* x, bool new_x,
+using Eval_F_CB = ipbool (*)(ipindex n, ipnumber* x, ipbool new_x,
                            ipnumber* obj_value, UserDataPtr user_data);
-using Eval_G_CB = bool (*)(ipindex n, ipnumber* x, bool new_x,
+using Eval_G_CB = ipbool (*)(ipindex n, ipnumber* x, ipbool new_x,
                            ipindex m, ipnumber* g, UserDataPtr user_data);
-using Eval_Grad_F_CB = bool (*)(ipindex n, ipnumber* x, bool new_x,
+using Eval_Grad_F_CB = ipbool (*)(ipindex n, ipnumber* x, ipbool new_x,
                                 ipnumber* grad_f, UserDataPtr user_data);
-using Eval_Jac_G_CB = bool (*)(ipindex n, ipnumber* x, bool new_x,
+using Eval_Jac_G_CB = ipbool (*)(ipindex n, ipnumber* x, ipbool new_x,
                                ipindex m, ipindex nele_jac,
                                ipindex* iRow, ipindex* jCol,
                                ipnumber* values, UserDataPtr user_data);
-using Eval_H_CB = bool (*)(ipindex n, ipnumber* x, bool new_x,
+using Eval_H_CB = ipbool (*)(ipindex n, ipnumber* x, ipbool new_x,
                            ipnumber obj_factor, ipindex m, ipnumber* lambda,
-                           bool new_lambda, ipindex nele_hess,
+                           ipbool new_lambda, ipindex nele_hess,
                            ipindex* iRow, ipindex* jCol,
                            ipnumber* values, UserDataPtr user_data);
-using Intermediate_CB = bool (*)(ipindex alg_mod, ipindex iter_count,
+using Intermediate_CB = ipbool (*)(ipindex alg_mod, ipindex iter_count,
                                  ipnumber obj_value, ipnumber inf_pr,
                                  ipnumber inf_du, ipnumber mu,
                                  ipnumber d_norm, ipnumber regularization_size,
                                  ipnumber alpha_du, ipnumber alpha_pr,
                                  ipindex ls_trials, UserDataPtr user_data);
+#else
+using ipbool = Bool;
 #endif
 
 // Function pointer types for dynamic loading of the official Ipopt C library (bundled in CasADi)
@@ -98,10 +101,10 @@ using CreateIpoptProblemFn = IpoptProblem (*)(
     Eval_Jac_G_CB eval_jac_g, Eval_H_CB eval_h);
 
 using FreeIpoptProblemFn = void (*)(IpoptProblem ipopt_problem);
-using AddIpoptStrOptionFn = bool (*)(IpoptProblem ipopt_problem, char* keyword, char* val);
-using AddIpoptNumOptionFn = bool (*)(IpoptProblem ipopt_problem, char* keyword, ipnumber val);
-using AddIpoptIntOptionFn = bool (*)(IpoptProblem ipopt_problem, char* keyword, ipindex val);
-using SetIntermediateCallbackFn = bool (*)(IpoptProblem ipopt_problem, Intermediate_CB intermediate_cb);
+using AddIpoptStrOptionFn = ipbool (*)(IpoptProblem ipopt_problem, char* keyword, char* val);
+using AddIpoptNumOptionFn = ipbool (*)(IpoptProblem ipopt_problem, char* keyword, ipnumber val);
+using AddIpoptIntOptionFn = ipbool (*)(IpoptProblem ipopt_problem, char* keyword, ipindex val);
+using SetIntermediateCallbackFn = ipbool (*)(IpoptProblem ipopt_problem, Intermediate_CB intermediate_cb);
 using IpoptSolveFn = ApplicationReturnStatus (*)(
     IpoptProblem ipopt_problem, ipnumber* x, ipnumber* g,
     ipnumber* obj_val, ipnumber* mult_g, ipnumber* mult_x_L,
@@ -446,7 +449,7 @@ void build_sparsity_patterns(IpoptCallbackContext& ctx) {
 // ============================================================================
 // Official C Callback Functions for IpStdCInterface
 // ============================================================================
-bool cb_eval_f(ipindex n, ipnumber* x, bool /*new_x*/,
+ipbool cb_eval_f(ipindex n, ipnumber* x, ipbool /*new_x*/,
                ipnumber* obj_value, UserDataPtr user_data) {
     auto* ctx = static_cast<IpoptCallbackContext*>(user_data);
     try {
@@ -459,7 +462,7 @@ bool cb_eval_f(ipindex n, ipnumber* x, bool /*new_x*/,
     }
 }
 
-bool cb_eval_grad_f(ipindex n, ipnumber* x, bool /*new_x*/,
+ipbool cb_eval_grad_f(ipindex n, ipnumber* x, ipbool /*new_x*/,
                     ipnumber* grad_f, UserDataPtr user_data) {
     auto* ctx = static_cast<IpoptCallbackContext*>(user_data);
     try {
@@ -473,7 +476,7 @@ bool cb_eval_grad_f(ipindex n, ipnumber* x, bool /*new_x*/,
     }
 }
 
-bool cb_eval_g(ipindex n, ipnumber* x, bool /*new_x*/,
+ipbool cb_eval_g(ipindex n, ipnumber* x, ipbool /*new_x*/,
                ipindex m, ipnumber* g, UserDataPtr user_data) {
     auto* ctx = static_cast<IpoptCallbackContext*>(user_data);
     if (m == 0) return true;
@@ -498,7 +501,7 @@ bool cb_eval_g(ipindex n, ipnumber* x, bool /*new_x*/,
     }
 }
 
-bool cb_eval_jac_g(ipindex n, ipnumber* x, bool /*new_x*/,
+ipbool cb_eval_jac_g(ipindex n, ipnumber* x, ipbool /*new_x*/,
                    ipindex /*m*/, ipindex nele_jac,
                    ipindex* iRow, ipindex* jCol,
                    ipnumber* values, UserDataPtr user_data) {
@@ -530,9 +533,9 @@ bool cb_eval_jac_g(ipindex n, ipnumber* x, bool /*new_x*/,
     }
 }
 
-bool cb_eval_h(ipindex n, ipnumber* x, bool /*new_x*/,
-               ipnumber obj_factor, ipindex /*m*/, ipnumber* lambda,
-               bool /*new_lambda*/, ipindex nele_hess,
+ipbool cb_eval_h(ipindex n, ipnumber* x, ipbool /*new_x*/,
+                 ipnumber obj_factor, ipindex /*m*/, ipnumber* lambda,
+                 ipbool /*new_lambda*/, ipindex nele_hess,
                ipindex* iRow, ipindex* jCol,
                ipnumber* values, UserDataPtr user_data) {
     auto* ctx = static_cast<IpoptCallbackContext*>(user_data);
@@ -563,7 +566,7 @@ bool cb_eval_h(ipindex n, ipnumber* x, bool /*new_x*/,
     }
 }
 
-bool cb_intermediate(ipindex /*alg_mod*/, ipindex iter_count,
+ipbool cb_intermediate(ipindex /*alg_mod*/, ipindex iter_count,
                      ipnumber obj_value, ipnumber inf_pr,
                      ipnumber inf_du, ipnumber mu,
                      ipnumber /*d_norm*/, ipnumber /*regularization_size*/,

@@ -115,7 +115,16 @@ enum class OpType {
 
     // Structured loop operators (subgraph reuse for independent vmap and sequential scan)
     Map,
-    Scan
+    Scan,
+
+    // Fused CPU neural network surrogate operators (MLP / Conv1D / MultiHeadAttention, fp32/fp64)
+    MLP,
+    Conv1D,
+    Attention,
+    Conv2D,
+    Pool2D,
+    RMSNorm,
+    Surrogate
 };
 
 // ============================================================================
