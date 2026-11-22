@@ -27,6 +27,7 @@ from .expr import (
     _to_fortran_flat,
     concat,
 )
+from .solvers.configs import SolverConfig
 from .solvers.ipopt_solver import solve_ipopt
 from .solvers.pymoo_solver import build_pymoo_problem, solve_pymoo
 from .solvers.scipy_solver import solve_scipy
@@ -521,11 +522,11 @@ class Opti(GraphBuilder):
 
     def solver(
         self,
-        name: str = "scipy",
+        name: Union[str, SolverConfig] = "scipy",
         method: Optional[Any] = None,
         options: Optional[Dict[str, Any]] = None,
-        use_hessian: bool = True,
-        auto_scale: bool = False,
+        use_hessian: Optional[bool] = None,
+        auto_scale: Optional[bool] = None,
         callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         """
@@ -545,6 +546,20 @@ class Opti(GraphBuilder):
             auto_scale: Automatically normalize variables, objective, and constraints to `O(1)` magnitudes before solving.
             callback: Optional per-iteration callback `fn(info_dict)`.
         """
+        if isinstance(name, SolverConfig):
+            self._solver_backend = name.backend
+            self._solver_method = name.method
+            merged_opts = name.to_options()
+            if options is not None:
+                merged_opts.update(options)
+            self._solver_options = merged_opts
+            self._use_hessian = bool(name.use_hessian if use_hessian is None else use_hessian)
+            self._auto_scale = bool(name.auto_scale if auto_scale is None else auto_scale)
+            cb = callback if callback is not None else name.callback
+            if cb is not None:
+                self._iter_callback = cb
+            return
+
         lname = name.lower().strip()
         if lname == "ipopt":
             self._solver_backend = "ipopt"
@@ -564,11 +579,12 @@ class Opti(GraphBuilder):
         else:
             raise ValueError(
                 f"Unsupported solver '{name}'. Supported: 'ipopt', 'scipy' ('SLSQP', 'trust-constr', 'L-BFGS-B'), "
-                f"or 'pymoo' ('DE', 'GA', 'PSO', 'CMAES', 'ISRES', 'SRES', 'NSGA2', 'NSGA3', 'MOEAD', 'SMSEMOA')."
+                f"or 'pymoo' ('DE', 'GA', 'PSO', 'CMAES', 'ISRES', 'SRES', 'NSGA2', 'NSGA3', 'MOEAD', 'SMSEMOA'), "
+                f"or a typed config from `fastopt.solvers.ipopt`, `fastopt.solvers.scipy`, or `fastopt.solvers.pymoo`."
             )
         self._solver_options = dict(options) if options is not None else {}
-        self._use_hessian = bool(use_hessian)
-        self._auto_scale = bool(auto_scale)
+        self._use_hessian = True if use_hessian is None else bool(use_hessian)
+        self._auto_scale = False if auto_scale is None else bool(auto_scale)
         if callback is not None:
             self._iter_callback = callback
 

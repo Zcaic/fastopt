@@ -4,6 +4,7 @@ fastopt: High-performance C++17 tensor-level automatic differentiation and optim
 
 from ._fastopt_impl import CompiledMLP, Evaluator, Graph, IpoptResult, NNActivation, OpType, Shape, solve_ipopt_cpp
 from . import nn
+from . import solvers
 from . import surrogate
 from .bemt_bridge import BEMTSymbolicOutput, FastBEMTAdapter
 from .blackbox import BlackBox, CBlackBox, CustomOp, blackbox, c_blackbox
@@ -94,6 +95,7 @@ __all__ = [
     "NNActivation",
     "CompiledMLP",
     "nn",
+    "solvers",
     "surrogate",
     "Graph",
     "Evaluator",

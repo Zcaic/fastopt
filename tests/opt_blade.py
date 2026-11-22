@@ -148,7 +148,7 @@ def tiltrotor_optimization():
 
     # Thrust targets [N] (use hover_thrust_factor > 1.0 to build in CFD & overload stall margin)
     T_hov_nominal = 15000.0
-    hover_thrust_factor = 1.2
+    hover_thrust_factor = 1.20
     T_hov_req = T_hov_nominal * hover_thrust_factor
     T_cru_req = 850.0
 
@@ -291,14 +291,14 @@ def tiltrotor_optimization():
     ph_b = opti_bh.variable(init=np.deg2rad(8.0), lb=np.deg2rad(-5.0), ub=np.deg2rad(16.0))
     ah_b = bemt_hov(pitch_0=ph_b, omega=omega_hov_base)
     opti_bh.minimize(fo.square((ah_b.thrust - T_hov_req) / T_hov_req) + 1e-6 * (ah_b.power * 1e-6))
-    opti_bh.solver("SLSQP", options={"ftol": 1e-10, "maxiter": 40})
+    opti_bh.solver(fo.solvers.scipy.SLSQP(ftol=1e-10, maxiter=40))
     sol_bh = opti_bh.solve()
 
     opti_bc = fo.Opti()
     pc_b = opti_bc.variable(init=np.deg2rad(45.0), lb=np.deg2rad(15.0), ub=np.deg2rad(65.0))
     ac_b = bemt_cru(pitch_0=pc_b, omega=omega_cru_base, vz=v_cruise)
     opti_bc.minimize(fo.square((ac_b.thrust - T_cru_req) / T_cru_req))
-    opti_bc.solver("SLSQP", options={"ftol": 1e-10, "maxiter": 40})
+    opti_bc.solver(fo.solvers.scipy.SLSQP(ftol=1e-10, maxiter=40))
     sol_bc = opti_bc.solve()
 
     # Extract actual trimmed baseline 5-section (alpha_deg, Re) from BEMT flowfield (zero manual alpha_hov_sec)
@@ -536,21 +536,19 @@ def tiltrotor_optimization():
     try:
         import casadi  # noqa: F401
         opti.solver(
-            "ipopt",
-            use_hessian=False,
-            options={
-                "max_iter": 400,
-                "tol": 1e-4,
-                "acceptable_tol": 5e-4,
-                "acceptable_constr_viol_tol": 5e-4,
-                "acceptable_iter": 60,
-                "limited_memory_max_history": 50,
-                "mu_strategy": "adaptive",
-                "print_level": 5,
-            },
+            fo.solvers.ipopt.IPOPT.lbfgs(
+                max_iter=400,
+                tol=1e-4,
+                acceptable_tol=5e-4,
+                acceptable_constr_viol_tol=5e-4,
+                acceptable_iter=60,
+                limited_memory_max_history=50,
+                mu_strategy="adaptive",
+                print_level=5,
+            )
         )
     except ImportError:
-        opti.solver("SLSQP", options={"ftol": 1e-5, "maxiter": 200})
+        opti.solver(fo.solvers.scipy.SLSQP(ftol=1e-5, maxiter=200))
 
     t0 = time.perf_counter()
     sol = opti.solve()
