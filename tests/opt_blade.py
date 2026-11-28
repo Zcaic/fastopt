@@ -8,6 +8,84 @@ except ImportError:
 import fast_bemt as fb
 import aerosandbox as asb
 
+def export_nx(cst_opt_mat,te_list,ctrl_r ,c_opt,tw_opt_deg):
+    import json 
+    from pathlib import Path
+
+    templata = '''
+import NXOpen
+import NXOpen.Features
+import json
+
+def modify_expr(expr_name: str, value: float, session: NXOpen.Session, unit: str = None):
+    part = session.Parts.Work
+    expr = part.Expressions.FindObject(expr_name)
+    unit = NXOpen.Unit.Null if unit is None else part.UnitCollection.FindObject(unit)
+    part.Expressions.EditExpressionWithUnits(expr, unit, f"{value:.6f}")
+
+data_file = "%(data_file)s"
+
+with open(data_file, "r") as fin:
+    data = json.load(fin)
+
+session = NXOpen.Session.GetSession()
+part = session.Parts.Work
+markid = session.SetUndoMark(NXOpen.Session.MarkVisibility.Visible, "modify airfoils")
+
+for name, coords in zip(data["afs_name"], data["afs"]):
+    spline = part.Features.FindObject(name)
+    splineEx = part.Features.CreateStudioSplineBuilderEx(spline)
+    for idx,i in enumerate(coords):
+         geoCon = splineEx.ConstraintManager.FindItem(idx)
+         pt = geoCon.Point
+         pt.SetCoordinates(NXOpen.Point3d(-i[1]*1000.0, 0.0, i[0]*1000.0))
+    
+    splineEx.Evaluate()
+    spline= splineEx.Commit()
+    splineEx.Destroy()
+
+session.UpdateManager.DoUpdate(markid)
+
+markid = session.SetUndoMark(NXOpen.Session.MarkVisibility.Visible, "modify expr")
+expr_list=data["expr"]
+for expr_name,(expr_val,expr_unit)in expr_list.items():
+    modify_expr(expr_name, expr_val, session, expr_unit)
+session.UpdateManager.DoUpdate(markid)
+'''
+
+    datas={}
+    datas["afs_name"]=["SPLINE(1)","SPLINE(4)","SPLINE(7)","SPLINE(10)","SPLINE(13)"]
+    afs_coords=[]
+    for i in range(5):
+        af=asb.KulfanAirfoil(lower_weights=cst_opt_mat[i,:8],upper_weights=cst_opt_mat[i,8:16],leading_edge_weight=cst_opt_mat[i,16],TE_thickness=te_list[i])
+        af=af.to_airfoil(n_coordinates_per_side=100)
+        afs_coords.append(af.coordinates.tolist())
+    datas["afs"]=afs_coords
+
+    expr_list={}
+    expr_list["p2"]=(c_opt[0]*1000.,"MilliMeter")
+    expr_list["p78"]=(c_opt[1]*1000.,"MilliMeter")
+    expr_list["p81"]=(c_opt[2]*1000.,"MilliMeter")
+    expr_list["p5"]=(c_opt[3]*1000.,"MilliMeter")
+    expr_list["p6"]=(c_opt[4]*1000.,"MilliMeter")
+    expr_list["p3"]=(c_opt[5]*1000.,"MilliMeter")
+
+    expr_list["p11"]=(tw_opt_deg[0],"MilliMeter")
+    expr_list["p15"]=(tw_opt_deg[1],"MilliMeter")
+    expr_list["p85"]=(tw_opt_deg[2],"MilliMeter")
+    expr_list["p86"]=(tw_opt_deg[3],"MilliMeter")
+    expr_list["p16"]=(tw_opt_deg[4],"MilliMeter")
+    expr_list["p12"]=(tw_opt_deg[5],"MilliMeter")
+
+    datas["expr"]=expr_list
+
+    js_file=Path("./runtime/data.json")
+    script_file=Path("./runtime/nx.py")
+
+    with open(js_file,"w") as fout:
+        json.dump(datas,fout)
+    script=templata%{"data_file":js_file.resolve().as_posix()}
+    script_file.write_text(script)
 
 def _eval_kulfan_coords(cst_vec17, te_thickness, n_pts=161):
     """Evaluate smooth cosine-spaced upper and lower Kulfan CST airfoil coordinates."""
@@ -148,7 +226,7 @@ def tiltrotor_optimization():
 
     # Thrust targets [N] (use hover_thrust_factor > 1.0 to build in CFD & overload stall margin)
     T_hov_nominal = 15000.0
-    hover_thrust_factor = 1.20
+    hover_thrust_factor = 1.07
     T_hov_req = T_hov_nominal * hover_thrust_factor
     T_cru_req = 850.0
 
@@ -175,7 +253,7 @@ def tiltrotor_optimization():
     cruise_power_limit_kw = 115.0
     hover_power_limit_kw = 580.0  # Ideal hover power at 19,500 N is 467.4 kW
     # Optional hover blade-loading cap CT/sigma at T_hov_req (set to None to disable; e.g., 0.175 at 1.2x overload -> 0.146 nominal)
-    max_hover_ct_sigma = 0.16
+    max_hover_ct_sigma = 0.17
     w_hover, w_cruise = 0.5, 0.5
 
     sec_r_norm = np.array([0.1, 0.2, 0.5, 0.75, 1.0], dtype=np.float64)
@@ -206,11 +284,13 @@ def tiltrotor_optimization():
 
     # Construct 5 initial Kulfan CST airfoils
     init_kulfans = [
-        fb.KulfanCSTAirfoil.from_aerosandbox(asb.Airfoil(coordinates="./tests/afs/DU-97-W-300.dat").to_kulfan_airfoil()),
-        fb.KulfanCSTAirfoil.from_aerosandbox(asb.Airfoil(coordinates="./tests/afs/DU-91-W2-250.dat").to_kulfan_airfoil()),
-        fb.KulfanCSTAirfoil.from_aerosandbox(asb.Airfoil(coordinates="./tests/afs/naca64-218.dat").to_kulfan_airfoil()),
-        fb.KulfanCSTAirfoil.from_aerosandbox(asb.Airfoil(coordinates="./tests/afs/naca64-212.dat").to_kulfan_airfoil()),
-        fb.KulfanCSTAirfoil.from_aerosandbox(asb.Airfoil(coordinates="./tests/afs/naca64-108.dat").to_kulfan_airfoil()),
+        # fb.KulfanCSTAirfoil.from_aerosandbox(asb.Airfoil(coordinates="./tests/afs/DU-97-W-300.dat").to_kulfan_airfoil().set_TE_thickness(2e-3)),
+        # fb.KulfanCSTAirfoil.from_aerosandbox(asb.Airfoil(coordinates="./tests/afs/DU-91-W2-250.dat").to_kulfan_airfoil().set_TE_thickness(2e-3)),
+        fb.KulfanCSTAirfoil.from_aerosandbox(asb.Airfoil(coordinates="./tests/afs/naca64-228.dat").to_kulfan_airfoil().set_TE_thickness(2e-3)),
+        fb.KulfanCSTAirfoil.from_aerosandbox(asb.Airfoil(coordinates="./tests/afs/naca64-226.dat").to_kulfan_airfoil().set_TE_thickness(2e-3)),
+        fb.KulfanCSTAirfoil.from_aerosandbox(asb.Airfoil(coordinates="./tests/afs/naca64-218.dat").to_kulfan_airfoil().set_TE_thickness(2e-3)),
+        fb.KulfanCSTAirfoil.from_aerosandbox(asb.Airfoil(coordinates="./tests/afs/naca64-212.dat").to_kulfan_airfoil().set_TE_thickness(2e-3)),
+        fb.KulfanCSTAirfoil.from_aerosandbox(asb.Airfoil(coordinates="./tests/afs/naca64-108.dat").to_kulfan_airfoil().set_TE_thickness(2e-3)),
     ]
     init_cst_mat = np.vstack([k.to_vector(include_te=False) for k in init_kulfans])  # (5, 17)
 
@@ -650,6 +730,8 @@ def tiltrotor_optimization():
         root_chord_bounds=(root_chord_lb, root_chord_ub),
         min_tip_chord=min_tip_chord,
     )
+
+    export_nx(cst_opt_mat,te_list,ctrl_r,c_opt,tw_opt_deg)
 
 
 if __name__ == "__main__":
